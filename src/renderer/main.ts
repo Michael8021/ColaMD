@@ -1,5 +1,6 @@
 import { createEditor, focusEditor, getMarkdown, getEditorView, getEditorScroller, onEditorJumpPhase, setMarkdown, setEditorEditable, getEditorState, restoreEditorState, applyMarkdownStyle, runFormatCommand, jumpToLine, jumpToHeading, setCleanExport, setDocumentFileUrl, type FormatCommandId } from './editor/editor'
 import { markdownForWord } from './editor/mermaid-export'
+import { withDiagramZoomPaused } from './editor/mermaid-bridge'
 import { jumpToSourceLine } from './editor/source-line'
 import { documentHTMLFrom } from './editor/clean-html'
 import { isPresenting, startSlideshow, stopSlideshow } from './slideshow'
@@ -1584,7 +1585,9 @@ function getExportSnapshot(content: string): {
     }
   }
   const editorRoot = document.querySelector<HTMLElement>('#editor .cm-content')
-  return {
+  // 导出交出去的是屏幕上这份 DOM：放大状态会跟着出去（纸上只剩图的一角），那排缩放按钮
+  // 也会被一起画上去。序列化的这会儿还原视口、藏掉控件，完事立刻恢复（见 withDiagramZoomPaused）。
+  return withDiagramZoomPaused(() => ({
     content,
     // 图片与 PDF 导出要的是「和屏幕上一模一样」，所以仍旧交编辑器那份 DOM；
     // HTML 导出交的是**一篇文档**：语义标签，没有编辑器自己的类名和行结构。
@@ -1595,7 +1598,7 @@ function getExportSnapshot(content: string): {
       .filter((name) => name !== 'show-file-panel' && name !== 'paper')
       .join(' '),
     background: getComputedStyle(document.body).backgroundColor,
-  }
+  }))
 }
 
 async function exportCurrentHTML(): Promise<void> {

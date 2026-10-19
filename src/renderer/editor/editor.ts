@@ -20,6 +20,7 @@ import { headingFlashEffect, setCleanExport as setCleanExportEffect, setDocument
 import { runFormatCommand as runFormat, type FormatCommandId } from './format-commands'
 import { isChinese } from '../ui-language'
 import { headingAnchorLine } from './heading-anchor'
+import { isDiagramZoomed } from './mermaid-bridge'
 
 // katex 的样式表仍要引，公式 widget 里渲出来的 HTML 靠它排版。
 import 'katex/dist/katex.min.css'
@@ -280,6 +281,12 @@ function installEditorInteractions(root: HTMLElement, view: EditorView): void {
   // 一个处理器管全部；块级 widget 的光标落点有 isBlockActive 兜着，光标进去就露源码。
   // 表格不在这里：它按点到的那一格落光标，走上面那条 mousedown。
   root.addEventListener('click', (e) => {
+    // 图上的缩放控件、以及放大态下的图，都是控件自己的地盘：点一下就把光标送进源码，
+    // 图当场没了，正在看的局部也就白缩了（控件由 mermaid-bridge 的 attachDiagramZoom 装）。
+    const hit = e.target as HTMLElement
+    if (hit.closest('.pele-zoom')) return
+    const diagram = hit.closest('.cm-md-mermaid') as HTMLElement | null
+    if (diagram && isDiagramZoomed(diagram)) return
     const widget = (e.target as HTMLElement).closest('[data-source-from]') as HTMLElement | null
     if (!widget) return
     const from = Number(widget.dataset.sourceFrom)

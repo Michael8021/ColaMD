@@ -122,6 +122,8 @@ All twelve built-in themes already ship as standalone, commented CSS files in [`
 
 **Status:** Mermaid blocks are rendered by [Pele](https://github.com/obsidianmd/pele) (MIT), the renderer Obsidian ships next. It is synchronous and dependency-free, so the hidden iframe, the 400ms debounce and the 15s timeout recovery are all gone; the engine itself is loaded on demand, so a document without a diagram pays nothing. Kept: click-to-edit source mode, and a block that fails to render keeps its code fence. Diagram colour comes from CSS variables that are derived from the theme (`themes/editor-preview.css`), so switching themes repaints the diagram without re-rendering it.
 
+Zoom (#129): a diagram that does not fit the column can be zoomed with Ctrl/⌘ + scroll wheel, the buttons in its corner, or a double click, and dragged to pan while zoomed. A diagram that already fits gets no controls at all. Exports reset the viewport and hide the buttons, so a zoomed diagram still leaves the whole picture on paper.
+
 ### Visible save status hint
 
 **Source:** [#49](https://github.com/marswaveai/ColaMD/issues/49)
@@ -248,12 +250,6 @@ Rule kept: exactly nine cards. The order is documented in an HTML comment above 
 **Architecture note:** 现有的富文本复制（`writeRichCopy()`）已经能产出语义 HTML，所以这个模式的本质是「同一套渲染 + 一份公众号专用的输出样式」，不是第二个渲染器。按「如非必要，勿增实体」，入口落在菜单里，不新增常驻工具栏。
 
 **Status:** Candidate, not scheduled. 参考实现是现成的（mdnice / markdown-nice 那一路：Markdown → 行内样式 HTML）。按项目里「参考老前辈的决策」的原则，先研究它们的样式表怎么定，再决定我们的做法，不自己发明一套。
-
-### Zoomable viewer for Mermaid diagrams (#129)
-
-**Source:** [#129](https://github.com/marswaveai/ColaMD/issues/129)
-
-Mermaid renders with `useMaxWidth`, so a diagram wider than the reading column scales down with no lower bound on text size, and `overflow-x` never engages because the SVG never exceeds 100%. Confirmed as a real limitation, not scheduled. Direction: a temporary overlay over the SVG that is already drawn (scroll to zoom, drag to pan, Esc or click-outside to close), because the content is vector, so zooming needs no second render and no new dependency. The rendering engine now ships `enableZoom`/`mount` for exactly this, so the remaining question is only the entry point: a hover button in the same pattern as the code block's copy button, or a double click.
 
 ### Selectable text inside a rendered block (#141, #153)
 

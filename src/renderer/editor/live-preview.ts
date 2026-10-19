@@ -27,7 +27,7 @@ import { forceParsing, syntaxTree } from '@codemirror/language'
 import type { SyntaxNode, SyntaxNodeRef } from '@lezer/common'
 import katex from 'katex'
 import { scanMath, excludedRanges, frontmatterRange, type Excluded } from './math-scan'
-import { renderMermaid } from './mermaid-bridge'
+import { renderMermaid, attachDiagramZoom, detachDiagramZoom, isDiagramZoomed } from './mermaid-bridge'
 import { sanitizeHTML, cleanStyle } from './html-sanitize'
 import { footnoteDefinitions, footnoteNumbers, FOOTNOTE_REF_RE } from './footnotes'
 import { isChinese } from '../ui-language'
@@ -535,6 +535,8 @@ class MermaidWidget extends WidgetType {
       .then((svg) => {
         wrap.innerHTML = svg
         wrap.classList.add('cm-md-mermaid-ready')
+        // 画不下的图（被 max-width 压窄了）才真出得来控件（#129）
+        attachDiagramZoom(wrap)
       })
       .catch(() => {
         // 画不出来就退回代码块，绝不吞掉用户的图
@@ -543,7 +545,35 @@ class MermaidWidget extends WidgetType {
       })
     return wrap
   }
+
+  destroy(dom: HTMLElement): void {
+    detachDiagramZoom(dom)
+  }
+
+  ignoreEvent(event: Event): boolean {
+    if (!POINTER_EVENTS.has(event.type)) return false
+    const target = event.target
+    if (!(target instanceof Element)) return false
+    // 控件上的事不给编辑器管：否则 mousedown 一落，CM 就把光标放到块里，块退回源码、图当场
+    // 没了（另有一条「点渲染块跳源码」在 editor.ts，那边按控件和放大态各挡一道）。
+    if (target.closest('.pele-zoom')) return true
+    // 放大之后按住拖是在挪图，不是在选字
+    const host = target.closest<HTMLElement>('.cm-md-mermaid')
+    return !!host && isDiagramZoomed(host)
+  }
 }
+
+// 编辑器管的事件里，只有指针那一小拨需要抢：滚轮、滚动、键盘都照旧归编辑器。
+const POINTER_EVENTS = new Set([
+  'mousedown',
+  'mouseup',
+  'click',
+  'dblclick',
+  'pointerdown',
+  'pointerup',
+  'touchstart',
+  'touchend',
+])
 
 function collectMermaid(state: EditorState, ranges: DecorationRange[], front: Range | null): void {
   const text = state.doc.toString()
