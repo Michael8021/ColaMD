@@ -1260,7 +1260,15 @@ function buildDecorations(state: EditorState, flash: { from: number; to: number 
   // 公式放最后：它覆盖区间，其它装饰不该插进它里面
   collectMath(state, ranges)
 
-  ranges.sort((a, b) => a.from - b.from || a.to - b.to)
+  // 排序键必须带上 startSide：RangeSetBuilder 只接受按 (from, startSide) 递增的顺序，
+  // 原来只按 (from, to) 排，同一段区间上挂了两种装饰时就翻车。
+  //
+  // 真事（#157）：`[![图](pic.png)](https://…)` 这种「链接里只包一张图」的写法，链接
+  // mark（startSide 5e8）和图片 widget（startSide 5e8 - 1）盖的是**同一段区间**，(from, to)
+  // 完全相等，先后全看数组原来的顺序。mark 排在前面就抛
+  // 「Ranges must be added sorted by `from` position and `startSide`」，整个装饰层作废，
+  // 表现是文件打开了但正文空白。
+  ranges.sort((a, b) => a.from - b.from || a.deco.startSide - b.deco.startSide || a.to - b.to)
   const builder = new RangeSetBuilder<Decoration>()
   for (const r of ranges) builder.add(r.from, r.to, r.deco)
   return builder.finish()

@@ -48,6 +48,9 @@ function fixture() {
     '',
     '![本地图片](pixel.png)',
     '',
+    // 链接里只包一张图：链接 mark 和图片 widget 盖同一段区间（#157）
+    '[![链接里的图](pixel.png)](https://example.com/img)',
+    '',
     '## 二级标题',
     '',
     '- 无序项一',
@@ -800,6 +803,8 @@ function main() {
       // 图片：点一下排版要还在（它的源码就一行，不露）
       {
         const appeared = await waitFor('.cm-md-image')
+        // 按点之前的张数比，不写死 1：固件里图片不止一张（#157 那个链接包图的回归样例）
+        const imagesBefore = Number(await evaluate(renderer, `document.querySelectorAll('.cm-md-image').length`))
         await clickBox(JSON.parse(await evaluate(renderer, `(() => {
           const el = document.querySelector('.cm-md-image')
           if (!el) return JSON.stringify({ x: 0, y: 0 })
@@ -814,8 +819,8 @@ function main() {
         await pressKey(renderer, 'z', 'KeyZ', 90, 4)
         await sleep(400)
         check('图片点一下不再翻成源码',
-          appeared && afterClick === 1 && afterTyping === 1,
-          `渲染块出现=${appeared} 点完=${afterClick} 行尾打字后=${afterTyping}`)
+          appeared && imagesBefore > 0 && afterClick === imagesBefore && afterTyping === imagesBefore,
+          `渲染块出现=${appeared} 点前=${imagesBefore} 点完=${afterClick} 行尾打字后=${afterTyping}`)
       }
 
       // 2026-10-08 报：鼠标拖选不到引用块和表格里的文字。这一组用真鼠标事件拖一遍，
