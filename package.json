@@ -41,7 +41,7 @@
     "docx": "^9.7.1",
     "electron-updater": "^6.8.9",
     "katex": "^0.16.47",
-    "mermaid": "^11.17.0",
+    "pele": "^1.6.0",
     "remark-gfm": "^4.0.1",
     "remark-parse": "^11.0.0",
     "unified": "^11.0.5"

@@ -1,4 +1,4 @@
-import { createEditor, focusEditor, getMarkdown, getEditorView, getEditorScroller, onEditorJumpPhase, setMarkdown, setEditorEditable, releaseMermaidRenderer, getEditorState, restoreEditorState, applyMarkdownStyle, runFormatCommand, jumpToLine, jumpToHeading, setCleanExport, setDocumentFileUrl, type FormatCommandId } from './editor/editor'
+import { createEditor, focusEditor, getMarkdown, getEditorView, getEditorScroller, onEditorJumpPhase, setMarkdown, setEditorEditable, getEditorState, restoreEditorState, applyMarkdownStyle, runFormatCommand, jumpToLine, jumpToHeading, setCleanExport, setDocumentFileUrl, type FormatCommandId } from './editor/editor'
 import { markdownForWord } from './editor/mermaid-export'
 import { jumpToSourceLine } from './editor/source-line'
 import { documentHTMLFrom } from './editor/clean-html'
@@ -484,7 +484,6 @@ function renderTabBar(): void {
 
 function showBlankDocument(): void {
   if (isPresenting()) stopSlideshow()
-  releaseMermaidRenderer()
   exitSourceMode()
   // A blank document carries no properties block from the one before it.
   activeFrontmatter = ''
@@ -1899,7 +1898,6 @@ async function init(): Promise<void> {
   api.onMenuPlaySlideshow(() => { void toggleSlideshow() })
 
   api.onNewFile(() => {
-    releaseMermaidRenderer()
     exitSourceMode()
     ensureTab()
     applyContent('')
@@ -1907,7 +1905,6 @@ async function init(): Promise<void> {
     renderTabBar()
   })
   api.onFileOpened((data) => {
-    releaseMermaidRenderer()
     // A document opened into a window that has none yet (a launch with a file)
     // lands in the first tab rather than creating a second one.
     ensureTab()

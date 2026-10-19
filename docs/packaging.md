@@ -12,7 +12,7 @@
 | `app.asar` | 169 MB | 10.7 MB |
 | 每架构 zip（自动更新要下的量） | universal 207 MB | **arm64 85.3 MB / x64 90.1 MB** |
 
-那 169MB 的 asar 里几乎全是被复制进包的生产依赖（光 mermaid 一个就 83.5MB），而 electron-vite 早已把这些库内联进 `dist`（dist 总共 10MB），所以那份拷贝是死重。asar 瘦身后只剩 `dist` 加 `package.json`，10.7MB，对得上。
+那 169MB 的 asar 里几乎全是被复制进包的生产依赖（光 mermaid 一个就 83.5MB；它在 2026-10 换成了 Pele，2.2MB），而 electron-vite 早已把这些库内联进 `dist`（dist 总共 10MB），所以那份拷贝是死重。asar 瘦身后只剩 `dist` 加 `package.json`，10.7MB，对得上。
 
 **规矩**
 

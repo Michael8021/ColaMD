@@ -1,143 +1,67 @@
-// Single hidden iframe that owns Mermaid rendering. Mermaid runs in the
-// sandbox document (its own chunk), keeping the main bundle and main thread
-// free of it. The iframe is created lazily on the first Mermaid block.
+// Mermaid 语法画成 SVG，由 Pele 渲染（Obsidian 那个渲染库，MIT，无运行时依赖）。
+//
+// Pele 是同步的，所以这里没有沙箱 iframe，也没有超时重置那一套：整个文件只剩一个
+// promise，用来懒加载——没写图表的文档不该为它付启动成本。
+//
+// 配色不在这里挑。Pele 生成的 SVG 里写的是 `var(--pele-*)`，在它落进的那个文档里取值，
+// 所以换主题不用重画（映射见 themes/editor-preview.css 的 `.cm-md-mermaid`）。唯一的例外
+// 是 Word 导出：SVG 要塞进 `<img>` 的 data URL，那是个独立文档，主题的变量到不了，
+// 只能把一套浅色值内联进根元素。
 
-const DARK_THEME_CLASSES = new Set([
-  'theme-dark',
-  'theme-solarized-dark',
-  'theme-nord',
-  'theme-gruvbox',
-  'theme-dracula',
-  'theme-midnight',
-])
+// 图里文字的字体族：**测量和绘制必须是同一个**，否则 CJK 标签会被量窄、裁掉右半边
+// （#94）。也刻意不跟着正文的字体设置走：用户选的是写作的字体，图不该跟着变。
+const DIAGRAM_FONT = '"PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif'
+const DIAGRAM_MONO_FONT = "'SF Mono', 'Fira Code', Menlo, Consolas, monospace"
 
-const RENDER_TIMEOUT_MS = 15_000
-
-type Pending = {
-  resolve: (svg: string) => void
-  reject: (reason: Error) => void
-  timer: ReturnType<typeof setTimeout>
+// Word 导出是一张白纸，不管应用现在是什么主题。这套值就是应用自己的浅色主题
+// （base.css 的 `:root, body.theme-light`）加上同一套百分比推出来的，所以上纸的图和
+// 界面上浅色主题下的图长得一样。刻意**不**沿用引擎的默认色：那是别人的取值，变了
+// 我们也看不见。
+const PRINT_PALETTE: Record<string, string> = {
+  '--pele-bg': '#ffffff',
+  '--pele-fg': '#24292f',
+  '--pele-muted': '#656d76',
+  '--pele-line': '#24292f',
+  '--pele-surface': '#d8d8da',
+  '--pele-surface-alt': '#c2c3c5',
+  '--pele-border': '#9c9fa1',
+  '--pele-accent': '#0969da',
 }
 
-type SandboxMessage =
-  | { type: 'ready' }
-  | { type: 'result'; id: number; ok: true; svg: string }
-  | { type: 'result'; id: number; ok: false; error: string }
+let pele: Promise<typeof import('pele/lazy')> | null = null
 
-let iframe: HTMLIFrameElement | null = null
-let ready = false
-let nextRenderId = 0
-const pending = new Map<number, Pending>()
-type QueuedRender = { run: () => void; reject: (reason: Error) => void }
-
-const waitingForReady: QueuedRender[] = []
-
-function currentTheme(): 'default' | 'dark' {
-  for (const cls of DARK_THEME_CLASSES) {
-    if (document.body.classList.contains(cls)) return 'dark'
-  }
-  return 'default'
+function loadPele(): Promise<typeof import('pele/lazy')> {
+  pele ??= import('pele/lazy')
+  return pele
 }
 
-// Diagrams render on the code-block background, which can disagree with the
-// app theme's overall brightness (elegant/bear are light themes with dark
-// code blocks). Pick the Mermaid palette by background luminance instead.
-function mermaidThemeForBackground(bg: string): 'default' | 'dark' {
-  const match = bg.trim().match(/^#([0-9a-f]{6})$/i)
-  if (!match) return currentTheme()
-  const value = parseInt(match[1], 16)
-  const r = (value >> 16) & 255
-  const g = (value >> 8) & 255
-  const b = value & 255
-  return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 < 0.5 ? 'dark' : 'default'
+// 把浅色值写进根元素的行内样式。要写在 Pele 自己那串前面：它那串里是
+// `--_bg: var(--pele-bg)` 这种取值语句，得先有定义。
+function withPrintPalette(svg: string): string {
+  const declarations = Object.entries(PRINT_PALETTE)
+    .map(([name, value]) => `${name}:${value}`)
+    .join(';')
+  const tagEnd = svg.indexOf('>')
+  if (tagEnd < 0) return svg
+  const tag = svg.slice(0, tagEnd)
+  const patched = tag.includes(' style="')
+    ? tag.replace(' style="', ` style="${declarations};`)
+    : `${tag} style="${declarations}"`
+  return patched + svg.slice(tagEnd)
 }
 
-function rejectAllPending(reason: Error): void {
-  for (const entry of pending.values()) {
-    clearTimeout(entry.timer)
-    entry.reject(reason)
-  }
-  pending.clear()
-}
-
-// A hung render (e.g. known Mermaid gantt OOM cases) must not poison later
-// ones: destroy the sandbox wholesale and let the next request rebuild it.
-function destroyIframe(): void {
-  if (iframe) {
-    iframe.remove()
-    iframe = null
-  }
-  ready = false
-  // Queued requests never entered `pending`; reject them too so code blocks
-  // leave source view instead of waiting forever after a sandbox reset.
-  const queued = waitingForReady.splice(0)
-  for (const entry of queued) entry.reject(new Error('渲染超时，已重置渲染器'))
-}
-
-function ensureIframe(): void {
-  if (iframe) return
-  iframe = document.createElement('iframe')
-  // Not display:none — hidden iframes still need layout for text measurement,
-  // otherwise rendered SVGs come out with zero size.
-  iframe.style.position = 'fixed'
-  iframe.style.left = '-9999px'
-  iframe.style.width = '1024px'
-  iframe.style.height = '768px'
-  iframe.style.visibility = 'hidden'
-  iframe.style.border = '0'
-  iframe.src = './mermaid-sandbox.html'
-  document.body.appendChild(iframe)
-}
-
-function dispatchRender(code: string, resolve: (svg: string) => void, reject: (reason: Error) => void, options: { theme?: 'default' | 'dark'; bg?: string } = {}): void {
-  const id = ++nextRenderId
-  const timer = setTimeout(() => {
-    pending.delete(id)
-    rejectAllPending(new Error('渲染超时，已重置渲染器'))
-    destroyIframe()
-  }, RENDER_TIMEOUT_MS)
-  pending.set(id, { resolve, reject, timer })
-  // The palette follows the surface the diagram is drawn on. On screen that is
-  // the code block's own colour; an export says which one it wants.
-  const bg = options.bg ?? getComputedStyle(document.body).getPropertyValue('--code-block-bg').trim()
-  iframe?.contentWindow?.postMessage({ type: 'render', id, code, theme: options.theme ?? mermaidThemeForBackground(bg), bg }, '*')
-}
-
-window.addEventListener('message', (event) => {
-  if (!iframe || event.source !== iframe.contentWindow) return
-  const data = event.data as SandboxMessage | undefined
-  if (!data) return
-
-  if (data.type === 'ready') {
-    ready = true
-    const queued = waitingForReady.splice(0)
-    for (const entry of queued) entry.run()
-    return
-  }
-
-  if (data.type === 'result') {
-    const entry = pending.get(data.id)
-    if (!entry) return
-    pending.delete(data.id)
-    clearTimeout(entry.timer)
-    if (data.ok) entry.resolve(data.svg)
-    else entry.reject(new Error(data.error || '语法错误'))
-  }
-})
-
-export function releaseMermaidRenderer(): void {
-  rejectAllPending(new Error('文档已切换'))
-  destroyIframe()
-}
-
-export function renderMermaid(code: string, options: { theme?: 'default' | 'dark'; bg?: string } = {}): Promise<string> {
-  ensureIframe()
-  return new Promise<string>((resolve, reject) => {
-    const run = () => dispatchRender(code, resolve, reject, options)
-    if (ready) {
-      run()
-    } else {
-      waitingForReady.push({ run, reject })
-    }
+/**
+ * 画一张图。`print` 给的是要离开这个文档的 SVG（Word 导出），配色内联进去。
+ * 画不出来就 reject，调用方把代码块原样留着：宁可难看，不吞用户的字。
+ *
+ * 走 `pele/lazy`：它认图表类型，只把那一种的分块拉进来。全量入口是 677KB，
+ * 一篇只画了一个流程图的笔记不该为甘特图和雷达图付内存。
+ */
+export async function renderMermaid(code: string, options: { print?: boolean } = {}): Promise<string> {
+  const { renderAsync } = await loadPele()
+  const { svg } = await renderAsync(code, {
+    fontFamily: DIAGRAM_FONT,
+    fontFamilyMono: DIAGRAM_MONO_FONT,
   })
+  return options.print ? withPrintPalette(svg) : svg
 }

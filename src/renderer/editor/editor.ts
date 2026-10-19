@@ -18,7 +18,6 @@ import { renderWholeDocument, restoreViewport } from '../print-layout'
 
 import { headingFlashEffect, setCleanExport as setCleanExportEffect, setDocumentFileUrlEffect, primeDocumentFileUrl } from './live-preview'
 import { runFormatCommand as runFormat, type FormatCommandId } from './format-commands'
-import { releaseMermaidRenderer as releaseMermaidRendererBridge } from './mermaid-bridge'
 import { isChinese } from '../ui-language'
 import { headingAnchorLine } from './heading-anchor'
 
@@ -112,12 +111,6 @@ function posFromDOM(view: EditorView, element: Element): number | null {
 //
 // 公式没有弹层，也没有第二个编辑器。它就是缓冲区里的几行文字：光标进那一行，
 // `$...$` 自动显形，就地改；光标离开，重新渲染。点击渲染后的公式只是把光标放进源码。
-
-// --- mermaid ---
-
-export function releaseMermaidRenderer(): void {
-  releaseMermaidRendererBridge()
-}
 
 // --- 格式命令 ---
 

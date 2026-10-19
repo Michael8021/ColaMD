@@ -1,7 +1,8 @@
 // Mermaid diagrams for the Word export.
 //
 // Word is a white page, so every diagram that goes into a .docx is rendered
-// again with Mermaid's light palette, even when the app is in a dark theme. The
+// again with a light palette inlined into the SVG, even when the app is in a dark
+// theme. The
 // SVG on screen is deliberately not reused: it may belong to a dark theme, and
 // in source mode (or on a block whose source is open for editing) there is no
 // SVG on screen at all, yet the export can still draw one.
@@ -24,7 +25,7 @@ export interface WordExportPayload {
 // Mermaid gives the SVG a viewBox and often a `width="100%"` style, which an
 // <img> cannot size from. Pin the natural size on a copy before serialising.
 async function diagramPNG(code: string): Promise<string | null> {
-  const svg = await renderMermaid(code, { theme: 'default', bg: '#ffffff' })
+  const svg = await renderMermaid(code, { print: true })
   const root = new DOMParser().parseFromString(svg, 'image/svg+xml').documentElement
   if (!root || root.nodeName !== 'svg') return null
 

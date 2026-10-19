@@ -508,7 +508,7 @@ function collectTaskItems(state: EditorState, ranges: DecorationRange[], front: 
 /**
  * ```mermaid 代码块画成图。
  *
- * 渲染是异步的（mermaid 要在隐藏沙箱里跑），所以先放一个占位，画好了再原地替换。
+ * 渲染是异步的（引擎要懒加载），所以先放一个占位，画好了再原地替换。
  * 失败就把代码块原样留着——图是锦上添花，代码是用户写的东西。
  */
 class MermaidWidget extends WidgetType {
@@ -526,10 +526,11 @@ class MermaidWidget extends WidgetType {
     withSourceRange(wrap, this.from, this.to)
     wrap.textContent = isChinese() ? '图表渲染中…' : 'Rendering diagram…'
 
-    // **不指定**配色：交给 mermaid-bridge 按代码块底色的明暗挑（和它自己的注释一致）。
-    // 这里曾经按应用主题挑（`theme-dark` 才用深色），可 elegant 和 bear 是浅色主题
-    // 配深色代码块，于是深底上画出了浅色主题的图：连线 #333 落在 #2c2c2c 上，
-    // 边缘文字也几乎看不见（2026-09-26 用户报的「线条和背景色太接近」）。
+    // **不指定**配色：图是画在代码块底色上的，颜色由 `--pele-*` 那组变量从主题推出来
+    // （themes/editor-preview.css 的 `.cm-md-mermaid`），换主题不用重画。
+    // 这里曾经按应用主题挑明暗两套调色板，可 elegant 和 bear 是浅色主题配深色代码块，
+    // 于是深底上画出了浅色主题的图：连线 #333 落在 #2c2c2c 上，边缘文字几乎看不见
+    // （2026-09-26 用户报的「线条和背景色太接近」）。现在没有「挑一套」这回事了。
     void renderMermaid(this.code)
       .then((svg) => {
         wrap.innerHTML = svg

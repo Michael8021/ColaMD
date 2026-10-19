@@ -503,6 +503,29 @@ body.exporting .cm-content .cm-md-frontmatter {
   padding: 0.8em 0;
   color: var(--text-muted);
   font-size: 0.9em;
+
+  /* Pele 画图用的变量。它的 SVG 里写的是 `var(--pele-*)`，在 SVG 落进的文档里取值，
+     所以换主题不用重画。
+
+     取值的依据是图**画在什么底上**：mermaid 代码块那一行的底色还在（`.cm-md-codeblock`
+     的 ::before），图就浮在它上面。所以底取自代码块，字取自代码块的字色；
+     elegant 和 bear 是浅色主题配深色代码块，它们的 --code-block-text 就是为这种情况
+     准备的（和 editor-preview.css 里代码块自己的写法一致）。
+
+     明暗两套调色板、按亮度挑一套的那套逻辑没了：底色和字色都从主题推出来，
+     对比度是算出来的，不是猜出来的。
+
+     百分比是量着定的：节点填充最初取 10%，Nord 上量出来是 #383E49 贴在 #262C37 的底上，
+     只靠一圈描边分界，显得糊（2026-10-19）。18% / 28% / 45% 三档在 9 个主题上都拉开了。 */
+  --pele-bg: var(--code-block-bg);
+  --pele-fg: var(--code-block-text, var(--text-color));
+  --pele-muted: color-mix(in srgb, var(--code-block-text, var(--text-color)) 70%, var(--code-block-bg));
+  --pele-line: var(--code-block-text, var(--text-color));
+  --pele-surface: color-mix(in srgb, var(--code-block-text, var(--text-color)) 18%, var(--code-block-bg));
+  --pele-surface-alt: color-mix(in srgb, var(--code-block-text, var(--text-color)) 28%, var(--code-block-bg));
+  --pele-border: color-mix(in srgb, var(--code-block-text, var(--text-color)) 45%, var(--code-block-bg));
+  --pele-accent: var(--link-color);
+  --pele-radius: 6px;
 }
 
 .cm-content .cm-md-mermaid svg {

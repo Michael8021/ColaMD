@@ -84,7 +84,7 @@ All twelve built-in themes already ship as standalone, commented CSS files in [`
 
 **Sources:** [#107](https://github.com/marswaveai/ColaMD/issues/107)
 
-**Status:** Every Mermaid block in the document becomes a picture in the `.docx`. Diagrams are rendered again for the export with Mermaid's light palette, because Word is a white page: the one on screen may belong to a dark theme, and in source mode there is no diagram on screen at all. A diagram that cannot be rendered keeps its code fence, so one broken block cannot fail an export.
+**Status:** Every Mermaid block in the document becomes a picture in the `.docx`. Diagrams are drawn again for the export with the app's light palette inlined into the SVG, because Word is a white page: the one on screen may belong to a dark theme, and in source mode there is no diagram on screen at all. A diagram that cannot be rendered keeps its code fence, so one broken block cannot fail an export.
 
 ### Text width
 
@@ -120,7 +120,7 @@ All twelve built-in themes already ship as standalone, commented CSS files in [`
 
 **Sources:** [#26](https://github.com/marswaveai/ColaMD/issues/26)
 
-**Status:** Mermaid blocks render through a lazily created hidden iframe, isolated from the main bundle (same-process iframe isolation, not a hardened browser sandbox). Includes 400ms debounce, click-to-edit source mode, and a 15s timeout recovery. The earlier CPU-storm removal (v1.8.1) is addressed by ignoring view-internal DOM mutations in the node view.
+**Status:** Mermaid blocks are rendered by [Pele](https://github.com/obsidianmd/pele) (MIT), the renderer Obsidian ships next. It is synchronous and dependency-free, so the hidden iframe, the 400ms debounce and the 15s timeout recovery are all gone; the engine itself is loaded on demand, so a document without a diagram pays nothing. Kept: click-to-edit source mode, and a block that fails to render keeps its code fence. Diagram colour comes from CSS variables that are derived from the theme (`themes/editor-preview.css`), so switching themes repaints the diagram without re-rendering it.
 
 ### Visible save status hint
 
@@ -253,7 +253,7 @@ Rule kept: exactly nine cards. The order is documented in an HTML comment above 
 
 **Source:** [#129](https://github.com/marswaveai/ColaMD/issues/129)
 
-Mermaid renders with `useMaxWidth`, so a diagram wider than the reading column scales down with no lower bound on text size, and `overflow-x` never engages because the SVG never exceeds 100%. Confirmed as a real limitation, not scheduled. Direction: a temporary overlay over the SVG that is already drawn (scroll to zoom, drag to pan, Esc or click-outside to close), because the content is vector, so zooming needs no second render and no new dependency. Entry point still to be decided: a hover button in the same pattern as the code block's copy button, or a double click.
+Mermaid renders with `useMaxWidth`, so a diagram wider than the reading column scales down with no lower bound on text size, and `overflow-x` never engages because the SVG never exceeds 100%. Confirmed as a real limitation, not scheduled. Direction: a temporary overlay over the SVG that is already drawn (scroll to zoom, drag to pan, Esc or click-outside to close), because the content is vector, so zooming needs no second render and no new dependency. The rendering engine now ships `enableZoom`/`mount` for exactly this, so the remaining question is only the entry point: a hover button in the same pattern as the code block's copy button, or a double click.
 
 ### Selectable text inside a rendered block (#141, #153)
 
@@ -290,7 +290,7 @@ Tabs can be opened and closed but not reordered. Not decided. Drag interactions 
 Measured, not guessed, and cheap enough to be worth listing:
 
 - Word count runs three full-document regex passes about 200ms after typing stops, although the number is only shown on hover. Compute on demand or maintain incrementally.
-- KaTeX sits on the startup path: 473KB is parsed even for a document with no math. Lazy-load it the way mermaid already is.
+- KaTeX sits on the startup path: 473KB is parsed even for a document with no math. Lazy-load it the way the diagram engine already is.
 - `releaseMermaidRenderer()` destroys the sandbox iframe on every file open, so a document with diagrams rebuilds and recompiles them each time. Being checked together with [#94](https://github.com/marswaveai/ColaMD/issues/94).
 - Windows-only compositing costs (`backdrop-filter`, several `box-shadow`) on integrated graphics, and documents between the source-mode threshold and "large". Measure before touching.
 
