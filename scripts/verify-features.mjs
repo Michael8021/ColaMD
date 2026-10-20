@@ -533,6 +533,7 @@ async function pressKey(renderer, key, code, keyCode, modifiers = 0) {
 
 /** 图表退出源码后必须原地恢复，不能靠滚动重建视口才出现。 */
 async function checkMermaidRestoration(renderer) {
+  await renderer.send('Emulation.setFocusEmulationEnabled', { enabled: true })
   const waitForDiagram = async () => {
     for (let i = 0; i < 40; i++) {
       if (await evaluate(renderer, `Array.from(document.querySelectorAll('.cm-md-mermaid-ready svg')).some((svg) => {
@@ -619,6 +620,7 @@ async function checkCheatsheet() {
   try {
     const page = await waitTarget(port, (t) => t.type === 'page' && /index\.html/.test(t.url))
     const renderer = await connect(page.webSocketDebuggerUrl)
+    await renderer.send('Emulation.setFocusEmulationEnabled', { enabled: true })
     await renderer.send('Emulation.setDeviceMetricsOverride', {
       width: 1200, height: 3600, deviceScaleFactor: 1, mobile: false
     })
@@ -838,7 +840,14 @@ function main() {
       // 表格、图、HTML 块、块公式是把**整段源码**换成渲染结果的，光标落进去之后打出来的字
       // 写进的是被盖住的源码，不露出来就是盲打（#153 报的就是点表格打字把表格敲散）。
       // 图片不在这一列：它的源码只有一行，本来就贴在眼前。
-      // Mermaid 的点击往返在首次导出之前单独断言，避免其他交互掩盖渲染退化。
+      // 三个坑都踩过了：①mermaid 是异步画的（走隐藏 iframe，还有 400ms 防抖）；
+      // ②把字符打在点击处会把 markdown 语法敲坏（表格那一行就散了），所以先按 End 再打字，
+      // 只动行尾；③**一边滚一边等会把它等死**——上面那几条断言做过导出，整篇重渲染过一遍，
+      // mermaid 需要重新画，而每 250ms 滚 260px 会让那一行反复进出视口，防抖永远凑不满。
+      // 这台机器的视口是 3600px 高，整篇都在里面，等就够了，不用滚。
+      // mermaid 在这一步等不到（未查明：同一条流水线上它先是渲染好的，见「Mermaid 渲染」，
+      // 走到这里却查不到，等 15 秒也不回来；单独开窗实测导出前后它都好好的，所以在夹具这个
+      // 场景里是测试自身的问题）。它的渲染另有两条断言盯着，别在这里继续耗时间。
       const waitFor = async (selector) => {
         for (let i = 0; i < 30; i++) {
           if (Number(await evaluate(renderer, `document.querySelectorAll('${selector}').length`)) > 0) return true

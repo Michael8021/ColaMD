@@ -112,6 +112,7 @@ async function main() {
   try {
     const page = await waitTarget(port, (t) => t.type === 'page' && /index\.html/.test(t.url))
     const renderer = await connect(page.webSocketDebuggerUrl)
+    await renderer.send('Emulation.setFocusEmulationEnabled', { enabled: true })
     for (let i = 0; i < 80; i++) {
       const lines = await evaluate(renderer, `document.querySelectorAll('#editor .cm-line').length`)
       if (Number(lines) > 5) break

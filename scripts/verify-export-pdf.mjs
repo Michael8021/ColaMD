@@ -109,6 +109,7 @@ async function main() {
     const page = await waitTarget(port, (t) => t.type === 'page' && /index\.html/.test(t.url))
     const mainTarget = await waitTarget(inspect, (t) => t.type === 'node')
     const renderer = await connect(page.webSocketDebuggerUrl)
+    await renderer.send('Emulation.setFocusEmulationEnabled', { enabled: true })
     const main = await connect(mainTarget.webSocketDebuggerUrl)
 
     // 测试不许占用屏幕：连上就藏好，并且别让导出流程把窗口叫回来

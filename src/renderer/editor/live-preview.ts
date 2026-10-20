@@ -575,29 +575,26 @@ const POINTER_EVENTS = new Set([
   'touchend',
 ])
 
-/** 两处共用同一判据：只有确实被图表替换的围栏，才跳过内部的隐藏装饰。 */
-function renderedMermaidCode(state: EditorState, node: Range): string | null {
-  if (isBlockActive(state, node.from, node.to)) return null
-  const text = state.doc.sliceString(node.from, node.to)
-  const firstLineEnd = text.indexOf('\n')
-  if (firstLineEnd === -1) return null
-  const opening = text.slice(0, firstLineEnd).trim()
-  if (!/^(`{3,}|~{3,})\s*mermaid\s*$/.test(opening)) return null
-  // 去掉开头的语言围栏与结尾的围栏；空块仍按普通代码块显示。
-  const code = text.slice(firstLineEnd + 1, text.lastIndexOf('\n'))
-  return code.trim() ? code : null
-}
-
 function collectMermaid(state: EditorState, ranges: DecorationRange[], front: Range | null): void {
+  const text = state.doc.toString()
   iterateContent(state, front, (node) => {
-    if (node.name !== 'FencedCode') return
-    const code = renderedMermaidCode(state, node)
-    if (code === null) return
-    ranges.push({
-      from: node.from,
-      to: node.to,
-      deco: Decoration.replace({ widget: new MermaidWidget(code, `${node.from}:${code.length}`, node.from, node.to) }),
-    })
+      if (node.name !== 'FencedCode') return
+      // 第一行是 ```mermaid 才画
+      const firstLineEnd = text.indexOf('\n', node.from)
+      if (firstLineEnd === -1) return
+      const opening = text.slice(node.from, firstLineEnd).trim()
+      if (!/^(`{3,}|~{3,})\s*mermaid\s*$/.test(opening)) return
+      if (isBlockActive(state, node.from, node.to)) return
+      // 去掉开头的 ```mermaid 行与结尾的 ```
+      const bodyStart = firstLineEnd + 1
+      const lastLineStart = text.lastIndexOf('\n', node.to - 1)
+      const code = text.slice(bodyStart, lastLineStart === -1 ? node.to : lastLineStart)
+      if (!code.trim()) return
+      ranges.push({
+        from: node.from,
+        to: node.to,
+        deco: Decoration.replace({ widget: new MermaidWidget(code, `${node.from}:${code.length}`, node.from, node.to) }),
+      })
   })
 }
 
@@ -1150,9 +1147,11 @@ function collectInline(state: EditorState, ranges: DecorationRange[], front: Ran
         case 'StrikethroughMark':
         case 'CodeMark': {
           const fence = node.node.parent
-          // 空替换和整块图表从同一位置开始时，CM6 增量更新可能只画出空替换，
-          // 图要等滚出视口再回来才恢复。整块已被替换，里面的围栏不必再藏一次。
-          if (node.name === 'CodeMark' && fence?.name === 'FencedCode' && renderedMermaidCode(state, fence) !== null) break
+          // 整块 Mermaid 替换与围栏空替换同起点时，增量更新会只留下空块。
+          if (node.name === 'CodeMark' && fence?.name === 'FencedCode' &&
+              !isBlockActive(state, fence.from, fence.to) &&
+              /^(`{3,}|~{3,})\s*mermaid\s*$/.test(state.doc.sliceString(fence.from, state.doc.lineAt(fence.from).to).trim()) &&
+              codeInsideFence(state, fence).trim()) break
           ranges.push({ from, to, deco: active ? MARK({ class: 'cm-md-marker' }) : hide(from, to) })
           break
         }
