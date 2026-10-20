@@ -124,6 +124,11 @@ const CASES = [
   ['fence', '```js\nconst a = 1\n```\n'],
   ['fence python', '```python\nprint(1)\n```\n'],
   ['fence tilde', '~~~\nplain\n~~~\n'],
+  ['mermaid fence', '```mermaid\ngraph TD; A-->B;\n```\n'],
+  ['mermaid tilde fence', '~~~mermaid\ngraph LR; A-->B;\n~~~\n'],
+  ['mermaid empty fence', '```mermaid\n```\n'],
+  ['mermaid invalid source', '```mermaid\nnot a diagram\n```\n'],
+  ['mermaid crlf fence', '```mermaid\r\ngraph TD; A-->B;\r\n```\r\n'],
 
   // 表格
   ['table', '| a | b |\n| --- | --- |\n| 1 | 2 |\n'],
