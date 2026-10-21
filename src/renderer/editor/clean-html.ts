@@ -76,7 +76,7 @@ function isOrdered(line: HTMLElement): boolean {
   return !!mark && /^\s*\d+[.)]/.test(mark.textContent ?? '')
 }
 
-/** 作者设置的行内样式沿用显示 HTML 时的白名单，语义标签可补继承的显式颜色。 */
+/** 行内样式沿用显示 HTML 时的白名单，语义标签补齐继承的文字颜色。 */
 function inlineStyleAttribute(node: HTMLElement, inheritedColor = ''): string {
   let style = cleanStyle(node.getAttribute('style') ?? '')
   if (inheritedColor && !node.style.color) style += `${style ? '; ' : ''}color: ${inheritedColor}`
@@ -104,7 +104,7 @@ function inlineHTML(node: Node, inheritedColor = ''): string {
   }
   if (classes.contains('cm-md-link')) {
     const href = node.getAttribute('data-href') ?? ''
-    // a、mark 的浏览器默认色会盖住继承色，显式带上作者指定的颜色。
+    // 为 a、mark 补齐继承的文字颜色，避免浏览器默认色覆盖。
     return `<a href="${escapeAttribute(href)}"${inlineStyleAttribute(node, inheritedColor)}>${childrenHTML(node, color)}</a>`
   }
   if (classes.contains('cm-md-footnote-ref')) {
@@ -124,7 +124,7 @@ function inlineHTML(node: Node, inheritedColor = ''): string {
   for (const [className, tag] of Object.entries(INLINE_TAGS)) {
     if (classes.contains(className)) return `<${tag}${inlineStyleAttribute(node, tag === 'mark' ? inheritedColor : '')}>${childrenHTML(node, color)}</${tag}>`
   }
-  // 其它行内包装去掉编辑器类，保留文字和作者显式设置的排版样式。
+  // 移除编辑器包装，保留行内内容和样式。
   return withInlineStyle(node, childrenHTML(node, color))
 }
 
