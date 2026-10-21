@@ -11,16 +11,18 @@
 
 import { type EditorState, type SelectionRange } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
+import { ensureSyntaxTree } from '@codemirror/language'
 import { createEditorCore, getEditorHandle, type EditorHandle } from './core'
 import { footnoteDefinitions } from './footnotes'
 import { selectionHTMLFrom } from './clean-html'
 import { renderWholeDocument, restoreViewport } from '../print-layout'
 
-import { headingFlashEffect, setCleanExport as setCleanExportEffect, setDocumentFileUrlEffect, primeDocumentFileUrl } from './live-preview'
+import { headingFlashEffect, livePreviewField, setCleanExport as setCleanExportEffect, setDocumentFileUrlEffect, primeDocumentFileUrl } from './live-preview'
 import { runFormatCommand as runFormat, type FormatCommandId } from './format-commands'
 import { isChinese } from '../ui-language'
 import { headingAnchorLine } from './heading-anchor'
 import { isDiagramZoomed } from './mermaid-bridge'
+import { frontmatterRange } from './math-scan'
 
 // katex 的样式表仍要引，公式 widget 里渲出来的 HTML 靠它排版。
 import 'katex/dist/katex.min.css'
@@ -428,6 +430,29 @@ function selectionHTML(view: EditorView, ranges: readonly SelectionRange[]): str
   return selectionHTMLFrom(selectionRange(view, ranges).cloneContents())
 }
 
+/** 跨行复制从标题开头起选时，把隐藏的行前缀也交给 Markdown 粘贴目标。 */
+function copiedMarkdown(state: EditorState, range: SelectionRange): string {
+  const line = state.doc.lineAt(range.from)
+  let from = range.from
+  // 单行选区仍按文字复制；属性区和代码中的 # 也不能当标题补齐。
+  if (range.to > line.to && range.from >= (frontmatterRange(state.doc.toString())?.to ?? 0)) {
+    let node = ensureSyntaxTree(state, line.to, 50)?.resolveInner(from, 1)
+    while (node && !/^ATXHeading[1-6]$/.test(node.name)) node = node.parent ?? undefined
+    const mark = node?.firstChild
+    if (mark?.name === 'HeaderMark') {
+      let start = mark.to
+      while (start < line.to && /[\t ]/.test(state.sliceDoc(start, start + 1))) start++
+      // 复用实际的隐藏装饰，涵盖加粗、链接、高亮等起始标记。
+      // 不越过有内容的 widget 或任何正文，避免补回刻意没选中的字。
+      state.field(livePreviewField, false)?.between(start, from, (a, b, decoration) => {
+        if (a <= start && b > start && b <= from && decoration.point && !decoration.spec.widget) start = b
+      })
+      if (from <= start) from = line.from
+    }
+  }
+  return state.sliceDoc(from, range.to)
+}
+
 /**
  * 大选区的复制：把整篇渲染出来再取 HTML，然后两个口味一起写回剪贴板。
  *
@@ -477,7 +502,7 @@ function setupRichCopy(root: HTMLElement): void {
     // 没选中东西时不动：CodeMirror 那时复制的是整行，那是它更懂的行为。
     const ranges = view.state.selection.ranges.filter((range) => !range.empty)
     if (ranges.length === 0) return
-    const text = ranges.map((range) => view.state.sliceDoc(range.from, range.to)).join('\n')
+    const text = ranges.map((range) => copiedMarkdown(view.state, range)).join('\n')
     event.clipboardData?.setData('text/plain', text)
     if (selectionRendered(view)) {
       const html = selectionHTML(view, ranges)
