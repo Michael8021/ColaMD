@@ -7,6 +7,8 @@
 // 所以这里做一次翻译：行 → `<p>`，连续的同类行合并成 `<ul>`/`<ol>`/`<blockquote>`/`<pre>`，
 // 装饰类 → 语义标签。**只读**：它不改编辑器里的任何东西，改的是要交出去的那份拷贝。
 
+import { cleanStyle } from './html-sanitize'
+
 /** 元素上的装饰类 → 语义标签。没登记的类原样透传（KaTeX、mermaid、图片要保住）。 */
 const INLINE_TAGS: Record<string, string> = {
   'cm-md-strong': 'strong',
@@ -74,7 +76,19 @@ function isOrdered(line: HTMLElement): boolean {
   return !!mark && /^\s*\d+[.)]/.test(mark.textContent ?? '')
 }
 
-function inlineHTML(node: Node): string {
+/** 作者设置的行内样式沿用显示 HTML 时的白名单，语义标签可补继承的显式颜色。 */
+function inlineStyleAttribute(node: HTMLElement, inheritedColor = ''): string {
+  let style = cleanStyle(node.getAttribute('style') ?? '')
+  if (inheritedColor && !node.style.color) style += `${style ? '; ' : ''}color: ${inheritedColor}`
+  return style ? ` style="${escapeAttribute(style)}"` : ''
+}
+
+function withInlineStyle(node: HTMLElement, html: string): string {
+  const attribute = inlineStyleAttribute(node)
+  return attribute ? `<span${attribute}>${html}</span>` : html
+}
+
+function inlineHTML(node: Node, inheritedColor = ''): string {
   if (node.nodeType === Node.TEXT_NODE) return escapeText(node.textContent ?? '')
   if (!(node instanceof HTMLElement)) return ''
 
@@ -82,17 +96,19 @@ function inlineHTML(node: Node): string {
   for (const dropped of DROP_CLASSES) {
     if (classes.contains(dropped)) return ''
   }
+  const color = node.style.color || inheritedColor
   // 属性区是文件的元数据，不属于正文
   if (classes.contains('cm-md-frontmatter')) return ''
   if (classes.contains('cm-md-html-block') || classes.contains('cm-md-html-inline')) {
-    return childrenHTML(node)
+    return withInlineStyle(node, childrenHTML(node, color))
   }
   if (classes.contains('cm-md-link')) {
     const href = node.getAttribute('data-href') ?? ''
-    return `<a href="${escapeAttribute(href)}">${childrenHTML(node)}</a>`
+    // a、mark 的浏览器默认色会盖住继承色，显式带上作者指定的颜色。
+    return `<a href="${escapeAttribute(href)}"${inlineStyleAttribute(node, inheritedColor)}>${childrenHTML(node, color)}</a>`
   }
   if (classes.contains('cm-md-footnote-ref')) {
-    return `<sup>${escapeText(node.textContent ?? '')}</sup>`
+    return `<sup${inlineStyleAttribute(node)}>${escapeText(node.textContent ?? '')}</sup>`
   }
   // 公式（KaTeX）、mermaid 图、图片：它们已经是能独立成立的 HTML，原样带走
   if (classes.contains('cm-md-math') || classes.contains('cm-md-mermaid')) {
@@ -106,14 +122,14 @@ function inlineHTML(node: Node): string {
   }
 
   for (const [className, tag] of Object.entries(INLINE_TAGS)) {
-    if (classes.contains(className)) return `<${tag}>${childrenHTML(node)}</${tag}>`
+    if (classes.contains(className)) return `<${tag}${inlineStyleAttribute(node, tag === 'mark' ? inheritedColor : '')}>${childrenHTML(node, color)}</${tag}>`
   }
-  // 其它（编辑器自己的行内 span 等）只保留里面的文字
-  return childrenHTML(node)
+  // 其它行内包装去掉编辑器类，保留文字和作者显式设置的排版样式。
+  return withInlineStyle(node, childrenHTML(node, color))
 }
 
-function childrenHTML(node: Node): string {
-  return Array.from(node.childNodes).map(inlineHTML).join('')
+function childrenHTML(node: Node, inheritedColor = ''): string {
+  return Array.from(node.childNodes).map((child) => inlineHTML(child, inheritedColor)).join('')
 }
 
 /** 一行里的正文（去掉列表标记、复制按钮这些零件）。 */

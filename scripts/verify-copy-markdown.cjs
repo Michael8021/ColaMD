@@ -285,6 +285,74 @@ async function run(win, files) {
     }
   }
 
+  // 富文本颜色看重新插入 HTML 后的计算样式，不能只断言字符串里有 style。
+  const inspectHTML = (html, labels) => ev(`(() => {
+    const host=document.createElement('div');host.style.cssText='position:absolute;left:-100000px;color:rgb(1,2,3)';
+    host.innerHTML=${JSON.stringify(html)};document.body.appendChild(host);
+    const result={};
+    for(const label of ${JSON.stringify(labels)}) {
+      const walker=document.createTreeWalker(host,NodeFilter.SHOW_TEXT);let text;
+      while((text=walker.nextNode())) if(text.textContent.includes(label)) {
+        const css=getComputedStyle(text.parentElement);
+        result[label]={color:css.color,background:css.backgroundColor,weight:css.fontWeight};break
+      }
+    }
+    host.remove();return result
+  })()`)
+  for (const [name, src, expected, label, color, extra] of [
+    ['完整红字', '<span style="color:red">⟦红字⟧</span>', '<span style="color:red">红字</span>', '红字', 'rgb(255, 0, 0)'],
+    ['部分红字', '<span style="color:red">红⟦色文字⟧</span>', '<span style="color:red">色文字</span>', '色文字', 'rgb(255, 0, 0)'],
+    ['红字内的加粗', '<span style="color:red">**⟦粗红字⟧**</span>', '<span style="color:red">**粗红字**</span>', '粗红字', 'rgb(255, 0, 0)', 'strong'],
+    ['加粗内的红字', '**<span style="color:red">⟦粗红字⟧</span>**', '**<span style="color:red">粗红字</span>**', '粗红字', 'rgb(255, 0, 0)', 'strong'],
+    ['红字内的高亮', '<span style="color:red">==⟦高亮红字⟧==</span>', '<span style="color:red">==高亮红字==</span>', '高亮红字', 'rgb(255, 0, 0)'],
+    ['红字内的链接', '<span style="color:red">[⟦红色链接⟧](https://example.com)</span>', '<span style="color:red">[红色链接](https://example.com)</span>', '红色链接', 'rgb(255, 0, 0)'],
+    ['链接内的红字', '[<span style="color:red">⟦红色链接⟧</span>](https://example.com)', '[<span style="color:red">红色链接</span>](https://example.com)', '红色链接', 'rgb(255, 0, 0)'],
+    ['标题内红字', '### <span style="color:red">⟦红字⟧</span>', '<span style="color:red">红字</span>', '红字', 'rgb(255, 0, 0)'],
+    ['从标题中间跨块的红字', '### 示例<span style="color:red">红⟦色文字</span>\n\n正文⟧', '### <span style="color:red">色文字</span>\n\n正文', '色文字', 'rgb(255, 0, 0)'],
+    ['十六进制颜色', '<span style="color:#12ab34">⟦绿字⟧</span>', '<span style="color:#12ab34">绿字</span>', '绿字', 'rgb(18, 171, 52)'],
+    ['文字色与背景色', '<span style="color:red;background-color:yellow">⟦红字⟧</span>', '<span style="color:red;background-color:yellow">红字</span>', '红字', 'rgb(255, 0, 0)', 'background'],
+    ['沿用样式白名单', '<span style="color:red;position:fixed">⟦红字⟧</span>', '<span style="color:red;position:fixed">红字</span>', '红字', 'rgb(255, 0, 0)', 'filtered'],
+    ['颜色不影响后文', '<span style="color:red">⟦红字</span>后文⟧', '<span style="color:red">红字</span>后文', '红字', 'rgb(255, 0, 0)', 'tail'],
+  ]) {
+    const { doc, from, to }=pick(src)
+    for (const reverse of [false,true]) {
+      await reset(doc,from,to,reverse)
+      const copied=await copy()
+      const labels=extra==='tail'?[label,'后文']:[label]
+      const rendered=await inspectHTML(copied.html,labels)
+      check(`${name} 富文本复制${reverse?'（反向）':''}`,()=>{
+        assert.equal(copied.text,expected)
+        assert.ok(copied.unchanged)
+        assert.equal(rendered[label]?.color,color,copied.html)
+        assert.ok(!copied.html.includes('cm-md-'),copied.html)
+        if(name.includes('链接')) assert.ok(copied.html.includes('<a href="https://example.com"'),copied.html)
+        if(name.includes('高亮')) assert.ok(copied.html.includes('<mark'),copied.html)
+        if(extra==='strong') assert.ok(Number(rendered[label].weight)>=600,copied.html)
+        if(extra==='background') assert.equal(rendered[label].background,'rgb(255, 255, 0)')
+        if(extra==='filtered') assert.ok(!copied.html.includes('position'),copied.html)
+        if(extra==='tail') assert.equal(rendered['后文']?.color,'rgb(1, 2, 3)')
+      })
+    }
+    const exported=await ev('window.__colamdExportDocumentHTML()')
+    const rendered=await inspectHTML(exported,[label])
+    check(`${name} HTML 导出保留颜色`,()=>{
+      assert.equal(rendered[label]?.color,color,exported)
+      if(extra==='filtered') assert.ok(!exported.includes('position'),exported)
+    })
+  }
+
+  // 真正经过系统剪贴板，在浏览器的富文本编辑区粘贴，再读文字颜色。
+  {
+    const {doc,from,to}=pick('<span style="color:#12ab34">⟦绿字⟧</span>')
+    await reset(doc,from,to)
+    await key('c',[mod])
+    await ev(`(() => {const target=document.createElement('div');target.id='copy-color-target';target.contentEditable='true';document.body.appendChild(target);target.focus()})()`)
+    await key('v',[mod])
+    const pasted=await ev(`(() => {const target=document.getElementById('copy-color-target');const html=target.innerHTML;target.remove();return html})()`)
+    const rendered=await inspectHTML(pasted,['绿字'])
+    check('系统剪贴板粘到富文本编辑区保留文字颜色',()=>assert.equal(rendered['绿字']?.color,'rgb(18, 171, 52)',pasted))
+  }
+
   // 粘回 ColaMD：系统剪贴板、粘贴、撤销、重做走一遍
   for (const [name, src, expected] of [
     ['高亮', '正文 ==⟦高亮⟧== 结尾', '==高亮=='],
