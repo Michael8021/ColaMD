@@ -119,7 +119,8 @@ async function run(win, files) {
     await sample(`H${level} 单独选部分文字`, doc, from + 1, end - 1, title.slice(1, -1))
     await sample(`H${level} 跨块正向复制`, doc, from, to, doc.slice(0, to), level)
     await sample(`H${level} 跨块反向复制`, doc, from, to, doc.slice(0, to), level, true)
-    await sample(`H${level} 从标题中间跨块不补前文`, doc, from + 1, to, doc.slice(from + 1, to), level)
+    await sample(`H${level} 从标题中间跨块保留级别但不补前文`, doc, from + 1, to, prefix + doc.slice(from + 1, to), level)
+    await sample(`H${level} 从标题中间反向跨块保留级别`, doc, from + 1, to, prefix + doc.slice(from + 1, to), level, true)
     await sample(`H${level} 源码行首起选不重复标记`, doc, 0, to, doc.slice(0, to), level)
     await sample(`H${level} 从标记中间起选补完整前缀`, doc, 1, to, doc.slice(0, to), level)
     await sample(`H${level} 选中标题后换行`, doc, from, end + 1, doc.slice(0, end + 1), level)
@@ -164,15 +165,13 @@ async function run(win, files) {
     ['前有正文', '前置正文\n\n### 文中标题', '文中标题', 3],
     ['混合格式', '## **粗体** 与 *斜体*', '粗体', 2],
   ]
-  // 从格式文字中间起选：标题标记不补，但切开的行内格式要补上开标记
-  const midOpeners = { 加粗: '**', 嵌套强调: '***', 删除线: '~~', 行内代码: '`', 链接: '[', 高亮: '==', 高亮嵌套加粗: '==**', 混合格式: '**' }
+  // 从格式文字中间跨块起选：保留块前缀与行内格式，但不带未选中的正文。
   for (const [name, heading, title, level] of special) {
-    midOpeners[name] ??= ''
     const doc = `${heading}\n\n后续正文`, from = doc.indexOf(title)
     const lineStart = doc.lastIndexOf('\n', from) + 1
     await sample(`${name} 跨块补齐原始前缀`, doc, from, doc.length, doc.slice(lineStart), level)
-    const expected = name === '带结束标记' ? '尾标记\n\n后续正文' : midOpeners[name] + doc.slice(from + 1)
-    await sample(`${name} 从正文中间开始不补标题标记`, doc, from + 1, doc.length, expected, level)
+    const expected = doc.slice(lineStart, from) + doc.slice(from + 1)
+    await sample(`${name} 从正文中间跨块保留标题级别`, doc, from + 1, doc.length, expected, level)
   }
   for (const [name, doc, text] of [
     ['缩进代码', '    ### 缩进代码\n    正文', '缩进代码'],
@@ -184,7 +183,6 @@ async function run(win, files) {
     ['Setext 二级', '下划线标题\n---\n\n正文', '下划线标题'],
     ['属性区', '---\ntitle: 属性\n### YAML文字\n---\n\n正文', 'YAML文字'],
     ['普通正文', '正文文字\n\n### 后面的标题', '文字'],
-    ['可见的引用链接括号', '### [引用文字][ref]\n\n后续正文\n\n[ref]: https://example.com', '引用文字'],
   ]) await sample(`${name} 不补不存在的标题前缀`, doc, doc.indexOf(text), doc.length, doc.slice(doc.indexOf(text)))
 
   // ⟦ ⟧ 标出选区在原文里的两端。端点故意放在隐藏标记的里侧或外侧，两种都要得到同样的结果。
@@ -228,7 +226,14 @@ async function run(win, files) {
     ['有序列表从三起', '3. ⟦三\n4. 四⟧', '3. 三\n4. 四', ['<ol start="3"><li>三</li><li>四</li></ol>']],
     ['待办跨项', '- [ ] ⟦待办一\n- [x] 待办二⟧', '- [ ] 待办一\n- [x] 待办二'],
     ['待办一项', '- [ ] ⟦待办⟧', '待办'],
-    ['列表项中间起选', '- 苹⟦果\n- 香蕉⟧', '果\n- 香蕉'],
+    ['列表项中间起选', '- 苹⟦果\n- 香蕉⟧', '- 果\n- 香蕉', '<ul>'],
+    ['标题中间跨块', '### 示例⟦标题\n\n后面的正文⟧', '### 标题\n\n后面的正文', '<h3>标题</h3>'],
+    ['有序列表中间跨项', '3. 苹⟦果\n4. 香蕉⟧', '3. 果\n4. 香蕉', '<ol start="3">'],
+    ['待办中间跨项', '- [x] 苹⟦果\n- [ ] 香蕉⟧', '- [x] 果\n- [ ] 香蕉'],
+    ['嵌套列表中间跨项', '- 甲\n  - 香⟦蕉\n  - 橙子⟧', '- 蕉\n- 橙子'],
+    ['引用中间跨出', '> 引用⟦文字\n\n正文⟧', '> 文字\n\n正文', '<blockquote>'],
+    ['引用内标题中间跨块', '> ### 示例⟦标题\n> 正文⟧', '### 标题\n正文', ['!<blockquote>', '<h3>标题</h3>']],
+    ['带结束标记中间跨块', '### 示例⟦标题 ###\n\n正文⟧', '### 标题 ###\n\n正文'],
     ['列表项内续行', '- ⟦甲\n  续行⟧', '甲\n续行', ['!<li>']],
     ['续行跨到下一项', '- ⟦甲\n  续行\n- 乙⟧', '- 甲\n  续行\n- 乙', ['<ul><li>甲<br>续行</li><li>乙</li></ul>']],
     ['嵌套列表跨项', '- 甲\n  - ⟦乙\n  - 丙⟧', '- 乙\n- 丙', ['<ul><li>乙</li><li>丙</li></ul>']],

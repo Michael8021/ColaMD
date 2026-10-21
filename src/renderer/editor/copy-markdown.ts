@@ -235,11 +235,16 @@ export function copiedMarkdown(state: EditorState, range: SelectionRange): strin
 
   const firstLine = state.doc.lineAt(from)
   let start = from
+  let blockHead = ''
   if (!fenceHead) {
     const base = lineBody(from)
     start = Math.max(from, base)
-    // 从块的开头起选：切开的块（标题、列表项、引用）带上自己的标记
-    if (!insideCode && !inFront && from <= contentStart(state, tree, base)) start = base
+    // 跨出的块保留类型；从文字中间起选时，只补前缀，不补没选中的文字。
+    if (!insideCode && !inFront) {
+      const content = contentStart(state, tree, base)
+      if (from <= content) start = base
+      else blockHead = state.sliceDoc(base, content)
+    }
   }
 
   // 结束在下一行的行首标记里：那一行屏幕上一个字也没选，标记不带
@@ -259,7 +264,7 @@ export function copiedMarkdown(state: EditorState, range: SelectionRange): strin
   const heading = ancestor(tree, Math.min(start, firstLine.to), 1, /^ATXHeading[1-6]$/)
   const openMark = heading?.firstChild
   const closeMark = heading?.lastChild
-  if (openMark && closeMark?.name === 'HeaderMark' && closeMark.from > openMark.to && start > openMark.from) {
+  if (!blockHead && openMark && closeMark?.name === 'HeaderMark' && closeMark.from > openMark.to && start > openMark.from) {
     let holeFrom = closeMark.from
     while (holeFrom > start && isSpace(state, holeFrom - 1)) holeFrom--
     holes.unshift([holeFrom, closeMark.to])
@@ -278,7 +283,7 @@ export function copiedMarkdown(state: EditorState, range: SelectionRange): strin
   // 选区两端切开的行内格式：开标记外层在前，闭标记内层在前
   const opening = spans.filter((span) => span.from < start && start < span.to).sort((a, b) => a.from - b.from || b.to - a.to)
   const closing = spans.filter((span) => span.from < to && to < span.to).sort((a, b) => a.to - b.to || b.from - a.from)
-  return fenceHead +
+  return fenceHead + blockHead +
     opening.map((span) => state.sliceDoc(span.from, span.openEnd)).join('') +
     body +
     closing.map((span) => state.sliceDoc(span.closeStart, span.to)).join('') +
