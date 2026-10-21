@@ -27,6 +27,7 @@ const DROP_CLASSES = new Set([
   // 光标所在的那一行会把 markdown 标记（`**`、`#`、`==` 等）露出来给人看，
   // 它们不属于正文，交出去的那份里不能带
   'cm-md-marker',
+  'cm-md-table-marker',
 ])
 
 type LineKind = 'code' | 'li' | 'quote' | 'hr' | 'table' | 'empty' | 'p' | `h${1 | 2 | 3 | 4 | 5 | 6}`
@@ -46,10 +47,10 @@ function lineKind(line: HTMLElement, includeList = true): LineKind {
   }
   // 图表沿用围栏行的代码块类，已有 SVG 时不能再按代码围栏删掉。
   if (line.querySelector('.cm-md-mermaid svg')) return 'p'
+  if (classes.contains('cm-md-table-row') || classes.contains('cm-md-table-delimiter')) return 'table'
   if (classes.contains('cm-md-codeblock')) return 'code'
   if (classes.contains('cm-md-blockquote')) return 'quote'
   if (classes.contains('cm-md-hr')) return 'hr'
-  if (line.querySelector('.cm-md-table-widget')) return 'table'
   if (classes.contains('cm-md-frontmatter')) return 'empty'
   if (includeList) for (let depth = 0; depth <= 6; depth++) {
     if (classes.contains(`cm-md-li-${depth}`)) return 'li'
@@ -97,6 +98,7 @@ function inlineHTML(node: Node): string {
     return node.innerHTML
   }
   if (node.tagName === 'IMG') return node.outerHTML
+  if (node.tagName === 'BR') return '<br>'
   if (classes.contains('cm-md-image')) {
     // 编辑器给图片套了一层定位用的 span，交出去的文档里只要那张图
     const img = node.querySelector('img')
@@ -230,12 +232,30 @@ function renderGroup(kind: LineKind, lines: HTMLElement[], ownerDepth = -1): str
     return `<blockquote>${lines.map((line) => `<p>${lineHTML(line)}</p>`).join('')}</blockquote>`
   }
   if (kind === 'table') {
-    const table = lines[0].querySelector<HTMLElement>('.cm-md-table-widget')
-    if (!table) return ''
-    // 表格本身是语义标签，只有那个类名是编辑器自己的
-    const clone = table.cloneNode(true) as HTMLElement
-    clone.classList.remove('cm-md-table-widget')
-    return clone.outerHTML
+    let html = ''
+    let head = ''
+    let body: string[] = []
+    const flush = () => {
+      if (head || body.length) html += `<table>${head}<tbody>${body.join('')}</tbody></table>`
+      head = ''
+      body = []
+    }
+    for (const line of lines) {
+      if (line.classList.contains('cm-md-table-delimiter')) continue
+      const header = line.classList.contains('cm-md-table-header')
+      const tag = header ? 'th' : 'td'
+      const cells = Array.from(line.querySelectorAll<HTMLElement>('.cm-md-table-cell'))
+        .map(cell => `<${tag} style="text-align:${cell.style.textAlign || 'left'}">${childrenHTML(cell).replace(/^[ \t]+|[ \t]+$/g, '')}</${tag}>`).join('')
+      if (header) {
+        flush()
+        head = `<thead><tr>${cells}</tr></thead>`
+      } else body.push(`<tr>${cells}</tr>`)
+      if (line.classList.contains('cm-md-table-last')) {
+        flush()
+      }
+    }
+    flush()
+    return html
   }
   if (kind === 'hr') return '<hr>'
   // 空行在 markdown 里只是段落分隔，元素本身已经把它表达出来了。
@@ -255,7 +275,7 @@ function renderGroup(kind: LineKind, lines: HTMLElement[], ownerDepth = -1): str
 
 /** 同类且可合并的块：列表、引用、代码要合起来才成形。 */
 function mergeable(kind: LineKind): boolean {
-  return kind === 'code' || kind === 'li' || kind === 'quote'
+  return kind === 'code' || kind === 'li' || kind === 'quote' || kind === 'table'
 }
 
 /** 把一串「行」按块翻译成 HTML。行与行之间是编辑器自己的排版，这里重建文档结构。 */
@@ -303,6 +323,18 @@ function blocksHTML(nodes: Node[], ownerDepth = -1): string {
       html += renderOwnedList(group, depth)
       continue
     }
+    if (node instanceof HTMLElement && node.classList.contains('cm-md-table-widget')) {
+      let table = blocksHTML(Array.from(node.childNodes))
+      const first = node.querySelector<HTMLElement>('.cm-md-table-row')
+      if (first?.classList.contains('cm-md-blockquote')) table = `<blockquote>${table}</blockquote>`
+      if (first?.classList.contains('cm-md-li')) {
+        const ordered = isOrdered(first)
+        table = `${listTag(first, ordered)}<li>${table}</li></${ordered ? 'ol' : 'ul'}>`
+      }
+      html += table
+      index += 1
+      continue
+    }
     if (!isLineElement(node)) {
       // 选区从一个行的中间开始或结束：连续的行内片段属于同一行，要合成一个段落。
       // 不合并的话，`含 **加粗**、` 会变成「含」「加粗」「、」三个段落。
@@ -322,7 +354,7 @@ function blocksHTML(nodes: Node[], ownerDepth = -1): string {
       let next = index + 1
       while (next < nodes.length) {
         const candidate = nodes[next]
-        if (!(candidate instanceof HTMLElement) || lineKind(candidate, !listContext(candidate)) !== kind ||
+        if (!isLineElement(candidate) || lineKind(candidate, !listContext(candidate)) !== kind ||
             (kind === 'p' && candidate.dataset.listParagraph !== paragraph)) break
         group.push(candidate)
         next += 1

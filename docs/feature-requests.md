@@ -299,15 +299,17 @@ LLM 生成的 Markdown 常常在段落之间留一串空行，读起来松垮。
 
 **Status:** Candidate, not scheduled. 参考实现是现成的（mdnice / markdown-nice 那一路：Markdown → 行内样式 HTML）。按项目里「参考老前辈的决策」的原则，先研究它们的样式表怎么定，再决定我们的做法，不自己发明一套。
 
-### Selectable text inside a rendered block (#141, #153)
+### Direct table cell editing (#153, #162)
 
-**Source:** [#141](https://github.com/marswaveai/ColaMD/issues/141), [#153](https://github.com/marswaveai/ColaMD/issues/153)
+**Source:** [#153](https://github.com/marswaveai/ColaMD/issues/153), [#162](https://github.com/marswaveai/ColaMD/issues/162)
 
-A rendered block (table, diagram, image, formula, raw HTML) is a replacement widget, so its own text never enters the selection model: dragging across a rendered table selects nothing, and the same holds for a diagram's labels.
+**Status:** In progress. Table cells stay editable in the rendered layout. The Markdown buffer remains the source of truth: decorations hide the pipes and separator row. Column widths use the contents of the whole table and stay fixed while scrolling; content, font or available-width changes recalculate them. Rows outside the viewport still unload. Tab moves between cells and adds a row at the end; Enter moves down, Mod+Enter inserts a row, and Shift+Enter inserts a line break. Pasted tab-separated data can extend the table. No toolbar is added.
 
-2026-10-15 changed what a click does (#153): block widgets reveal their Markdown while the caret is inside, and clicking a table cell lands the caret in that cell of the source (`isBlockActive` in `live-preview.ts`, `tableCellAnchor` in `editor.ts`). The reported problem, that typing after clicking a table destroyed it, is gone with that.
+### Selectable text inside other rendered blocks (#141)
 
-Still open: editing and selecting text inside the rendered block itself, without stepping into the source. The document is text and rendering is a layer of decoration over it (`docs/editor-architecture.md`), so that is a structural change rather than a styling fix: the rendered table would have to stay real text, with the pipes hidden and the cells padded so the columns line up. Undecided.
+**Source:** [#141](https://github.com/marswaveai/ColaMD/issues/141)
+
+Diagrams, images, formulas and raw HTML remain replacement widgets. Selecting their rendered text without entering the source is still undecided; table editing does not change those blocks.
 
 ### XDG data directories on Linux (#142)
 

@@ -287,7 +287,6 @@
  * 夹着一个块级 widget，就成了两个各 30.4px 高的匿名块，照样多出 61px。所以要让它们
  * **脱离行内流**（absolute）。不能用 display:none：缓冲块是 CodeMirror 用来给光标定位
  * 的，没有 rect 时光标会跳到别处。 */
-.cm-content .cm-line:has(> .cm-md-table-widget) > .cm-widgetBuffer,
 .cm-content .cm-line:has(> .cm-md-mermaid) > .cm-widgetBuffer,
 .cm-content .cm-line:has(> .cm-md-math-block) > .cm-widgetBuffer,
 .cm-content .cm-line:has(> .cm-md-html-block) > .cm-widgetBuffer {
@@ -298,31 +297,69 @@
 
 /* ======= 表格 ======= */
 
-/* 表格画成真表格（live-preview 的 TableWidget）。光标进表格时退回源码，
- * 这时每一行是一段等宽文字，底色让它读起来还是一块。 */
-.cm-content .cm-md-table {
-  background: color-mix(in srgb, var(--table-header-bg, transparent) 45%, transparent);
-  font-family: var(--font-mono);
-  font-size: 0.875em;
-}
-
 .cm-content .cm-md-table-widget {
-  border-collapse: collapse;
+  display: table;
   width: 100%;
+  border-spacing: 0;
+  table-layout: auto;
+  box-sizing: border-box;
   margin: 0.25em 0;
 }
 
-.cm-content .cm-md-table-widget th,
-.cm-content .cm-md-table-widget td {
-  border: 1px solid var(--border-color);
-  padding: 8px 12px;
-  text-align: left;
+.cm-content .cm-md-table-row {
+  display: table-row;
+  border-left: none;
+  padding: 0;
 }
 
-.cm-content .cm-md-table-widget th {
+.cm-content .cm-md-table-cell {
+  display: table-cell;
+  min-width: calc(2em + 26px);
+  min-height: 1.75em;
+  padding: 8px 12px;
+  border-right: 1px solid var(--border-color);
+  border-bottom: 1px solid var(--border-color);
+  vertical-align: top;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.cm-content .cm-md-table-cell[data-column="0"] { border-left: 1px solid var(--border-color); }
+
+.cm-content .cm-md-table-header {
   background: var(--table-header-bg);
   font-weight: 600;
 }
+
+.cm-content .cm-md-table-header .cm-md-table-cell { border-top: 1px solid var(--border-color); }
+
+.cm-content .cm-md-table-marker {
+  display: inline-block;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+  font-size: 0;
+}
+
+.cm-content .cm-md-table-delimiter {
+  display: none;
+}
+
+.cm-md-table-widget > .cm-gap { display: table-row; }
+.cm-content .cm-md-table-row > .cm-widgetBuffer { display: none; }
+.cm-content .cm-md-table-row > br { display: none; }
+.cm-content .cm-md-table-row > span:not(.cm-md-table-cell) { display: none; }
+.cm-content .cm-md-table-padding { font-size: 0; }
+.cm-content .cm-md-table-number { white-space: nowrap; }
+
+.cm-content .cm-md-table-input {
+  display: block;
+  min-height: 1.75em;
+  outline: none;
+  caret-color: var(--text-color);
+}
+
+.cm-editor:has(.cm-md-table-input:focus) .cm-cursorLayer { display: none; }
 
 /* ======= 分隔线 ======= */
 
@@ -688,20 +725,22 @@ body.theme-writer .cm-content .cm-md-blockquote {
 }
 
 /* 表格 */
-body.theme-elegant .cm-content .cm-md-table-widget th,
-body.theme-elegant .cm-content .cm-md-table-widget td,
-body.theme-notion .cm-content .cm-md-table-widget th,
-body.theme-notion .cm-content .cm-md-table-widget td {
-  border-left: none;
+body.theme-elegant .cm-content .cm-md-table-cell[data-column="0"],
+body.theme-notion .cm-content .cm-md-table-cell[data-column="0"] { border-left: none; }
+
+body.theme-elegant .cm-content .cm-md-table-header .cm-md-table-cell,
+body.theme-elegant .cm-content .cm-md-table-row:not(.cm-md-table-header) .cm-md-table-cell,
+body.theme-notion .cm-content .cm-md-table-header .cm-md-table-cell,
+body.theme-notion .cm-content .cm-md-table-row:not(.cm-md-table-header) .cm-md-table-cell {
   border-right: none;
 }
 
-body.theme-elegant .cm-content .cm-md-table-widget th {
+body.theme-elegant .cm-content .cm-md-table-header .cm-md-table-cell {
   border-bottom: 2px solid #c44b2b;
 }
 
-body.theme-writer .cm-content .cm-md-table-widget th,
-body.theme-writer .cm-content .cm-md-table-widget td {
+body.theme-writer .cm-content .cm-md-table-header .cm-md-table-cell,
+body.theme-writer .cm-content .cm-md-table-row:not(.cm-md-table-header) .cm-md-table-cell {
   font-size: 0.9em;
 }
 

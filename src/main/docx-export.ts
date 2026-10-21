@@ -67,7 +67,7 @@ function inlineRuns(nodes: MarkdownNode[] | undefined, style: { bold?: boolean; 
   for (const node of nodes) {
     if (node.type === 'text') {
       runs.push(new TextRun({ text: node.value ?? '', ...style }))
-    } else if (node.type === 'break') {
+    } else if (node.type === 'break' || (node.type === 'html' && /^<br\s*\/?>$/i.test(node.value ?? ''))) {
       runs.push(new TextRun({ break: 1, ...style }))
     } else if (node.type === 'inlineCode') {
       runs.push(new TextRun({ text: node.value ?? '', font: 'Menlo', shading: { fill: 'F1F3F5' } }))
@@ -124,8 +124,8 @@ function tableForNode(node: MarkdownNode): Table {
   return new Table({
     width: { size: 100, type: WidthType.PERCENTAGE },
     rows: (node.children ?? []).map((row) => new TableRow({
-      children: (row.children ?? []).map((cell) => new TableCell({
-        children: [new Paragraph({ children: inlineRuns(cell.children) })],
+      children: Array.from({ length: node.children?.[0]?.children?.length ?? 0 }, (_, column) => new TableCell({
+        children: [new Paragraph({ children: inlineRuns(row.children?.[column]?.children) })],
       })),
     })),
   })
@@ -143,6 +143,13 @@ function blockNodes(nodes: MarkdownNode[] | undefined, sourcePath: string | null
     } else if (node.type === 'image') {
       output.push(imageParagraph(node, sourcePath, images))
     } else if (node.type === 'blockquote') {
+      if (node.children?.some(child => child.type === 'table')) {
+        for (const child of node.children) {
+          if (child.type === 'table') output.push(tableForNode(child))
+          else output.push(...blockNodes([{ ...node, children: [child] }], sourcePath, images, listDepth))
+        }
+        continue
+      }
       output.push(new Paragraph({
         children: [new TextRun({ text: textContent(node), italics: true })],
         indent: { left: 720 },

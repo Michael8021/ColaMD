@@ -17,7 +17,7 @@
 // 原因不是风格问题：CodeMirror 把「函数式提供的装饰」标记为动态，而动态装饰
 // **不许跨行替换**，命中就抛 `RangeError: Decorations that replace line breaks may not
 // be specified via plugins`（node_modules/@codemirror/view/dist/index.cjs:2780）。
-// 块公式、属性区、mermaid、表格都是跨行替换，用 compute 提供会让整层装饰更新中途抛错，
+// 块公式、属性区、mermaid 都是跨行替换，用 compute 提供会让整层装饰更新中途抛错，
 // 表现为「整个界面错乱」。StateField + provide 提供的是装饰集本身，不是函数，
 // 跨行替换与块级 widget 才被允许。
 
@@ -342,14 +342,14 @@ function isActiveRange(_state: EditorState, _from: number, _to: number): boolean
 }
 
 /**
- * 块级 widget（表格、图、HTML 块、块公式）的判据：光标落进块里就露源码。
+ * 块级 widget（图、HTML 块、块公式）的判据：光标落进块里就露源码。
  *
  * 这些块是把**整段源码**替换成渲染结果的，光标一落进去，打出来的字写进的是被盖住的
- * 源码。所以光标进块时把源码露出来，点走再渲染回去。Obsidian 对表格就是这么做的，
- * 也是 2026-10-15 对 #153 的裁定。
+ * 源码。所以光标进块时把源码露出来，点走再渲染回去（2026-10-15 对 #153 的裁定）。
+ * 表格不在此列：它保留为文字装饰，在单元格里直接改（table-editing.ts）。
  *
  * 行内的标记不在此列（2026-10-06 定）：光标所在的行不再整行露源码，要改标记去源码模式。
- * 两端都算在内：点表格落在源码第一行开头，那是块的起点，也算「在里面」。
+ * 两端都算在内：点图表落在源码第一行开头，那是块的起点，也算「在里面」。
  */
 function isBlockActive(state: EditorState, from: number, to: number): boolean {
   const sel = state.selection.main
@@ -644,188 +644,6 @@ function collectFrontmatter(state: EditorState, ranges: DecorationRange[], front
   // 这一行本来就是个空壳，直接压成零高。
   const firstLine = state.doc.lineAt(front.from)
   ranges.push({ from: firstLine.from, to: firstLine.from, deco: Decoration.line({ class: 'cm-md-frontmatter-folded' }) })
-}
-
-// ─── 表格 ────────────────────────────────────────────────────────────────────
-
-/**
- * 表格画成真的 `<table>`。
- *
- * 为什么这里不像别的块一样「只加样式」：markdown 表格的单元格在源码里只是被 `|`
- * 隔开的文字，行是一个个独立的 div，**没有任何办法给单元格画边框、做对齐**。
- * 只加底色的结果是几条彩色横条，不是表格。Obsidian 与 Typora 都是把表格渲染成真表格，
- * 光标进去才回到源码，这里照做。
- *
- * 光标落在表格的任意一行里时退回源码，所以改表格仍然是改文字。
- */
-class TableWidget extends WidgetType {
-  constructor(readonly source: string, readonly base: string | null, readonly from: number, readonly to: number) {
-    super()
-  }
-
-  eq(other: TableWidget): boolean {
-    return other.source === this.source && other.base === this.base && other.from === this.from && other.to === this.to
-  }
-
-  toDOM(): HTMLElement {
-    const rows = parseTable(this.source)
-    const table = document.createElement('table')
-    table.className = 'cm-md-table-widget'
-    withSourceRange(table, this.from, this.to)
-    if (rows.length === 0) {
-      table.textContent = this.source
-      return table
-    }
-    const [head, , ...body] = rows
-    const thead = document.createElement('thead')
-    const headRow = document.createElement('tr')
-    head.forEach((cell, index) => {
-      const th = document.createElement('th')
-      th.style.textAlign = alignOf(rows[1]?.[index] ?? '')
-      appendInline(th, cell, this.base)
-      headRow.appendChild(th)
-    })
-    thead.appendChild(headRow)
-    table.appendChild(thead)
-    const tbody = document.createElement('tbody')
-    for (const row of body) {
-      const tr = document.createElement('tr')
-      for (let i = 0; i < head.length; i++) {
-        const td = document.createElement('td')
-        td.style.textAlign = alignOf(rows[1]?.[i] ?? '')
-        appendInline(td, row[i] ?? '', this.base)
-        tr.appendChild(td)
-      }
-      tbody.appendChild(tr)
-    }
-    table.appendChild(tbody)
-    return table
-  }
-}
-
-/** 按行拆表格源码，行内按未转义的 `|` 拆单元格。 */
-function parseTable(source: string): string[][] {
-  return source
-    .split('\n')
-    .filter((line) => line.trim() !== '')
-    .map((line) => {
-      const trimmed = line.trim().replace(/^\|/, '').replace(/\|$/, '')
-      const cells: string[] = []
-      let current = ''
-      for (let i = 0; i < trimmed.length; i++) {
-        const char = trimmed[i]
-        if (char === '\\' && trimmed[i + 1] === '|') {
-          current += '|'
-          i++
-          continue
-        }
-        if (char === '|') {
-          cells.push(current.trim())
-          current = ''
-          continue
-        }
-        current += char
-      }
-      cells.push(current.trim())
-      return cells
-    })
-}
-
-/** 分隔行里的对齐标记：`:---` 左、`:---:` 居中、`---:` 右。 */
-function alignOf(delimiter: string): string {
-  const cell = delimiter.trim()
-  const left = cell.startsWith(':')
-  const right = cell.endsWith(':')
-  if (left && right) return 'center'
-  if (right) return 'right'
-  return 'left'
-}
-
-/**
- * 单元格里的行内内容。
- *
- * 用 DOM 拼，不拼 innerHTML：单元格内容来自用户的文件，拼字符串等于把文件里的
- * `<img onerror=...>` 直接执行掉。这里只认粗体、斜体、行内代码、删除线、链接、
- * 图片和 `<br>`，认不出来的就当普通文字。
- *
- * `<br>` 与图片是 #138 补上的：Obsidian、Typora、GitHub 都把格子里的 `<br/>` 画成
- * 换行，把格子里的 `![](x.png)` 画成图片；2.6 也这样，换内核后这两样都退成了纯文字。
- * 行内 HTML 里只有 `<br>` 被认：它是最常跟表格一起用的一个，而其它标签（尤其是带
- * 事件或样式的）放进表格只会多一个要防的口子。
- *
- * 下划线强调要卡词边界（#161）。CommonMark 与 GFM 里 `_` 不能跨在词中间生效，
- * 所以 `local_upload / external_api` 是两个普通单词，`snake_case_name` 也一样；
- * 这里早期只写了 `_` 配对，会把中间那段吃掉变成斜体，连下划线本身也不见了。
- * `*` 不受这条限制（`a*b*c` 在 CommonMark 里确实是斜体），所以两个分支分开写。
- * 边界用 Unicode 字母与数字，中文也算词字符。
- */
-const INLINE_RE =
-  /\*\*(?<strong>.+?)\*\*|(?<![\p{L}\p{N}_])__(?<strongU>(?=\S).+?(?<=\S))__(?![\p{L}\p{N}_])|\*(?<em>.+?)\*|(?<![\p{L}\p{N}_])_(?<emU>(?=\S).+?(?<=\S))_(?![\p{L}\p{N}_])|`(?<code>[^`]+)`|~~(?<strike>.+?)~~|!\[(?<alt>[^\]]*)\]\(\s*(?<src><[^>]*>|[^)\s]+)[^)]*\)|\[(?<linkText>[^\]]*)\]\((?<href>[^)]*)\)|<br\s*\/?>/giu
-
-function appendInline(parent: HTMLElement, text: string, base: string | null): void {
-  INLINE_RE.lastIndex = 0
-  let last = 0
-  let match: RegExpExecArray | null
-  while ((match = INLINE_RE.exec(text)) !== null) {
-    if (match.index > last) parent.appendChild(document.createTextNode(text.slice(last, match.index)))
-    const g = match.groups ?? {}
-    if (g.strong !== undefined || g.strongU !== undefined) {
-      const el = document.createElement('strong')
-      el.textContent = g.strong ?? g.strongU ?? ''
-      parent.appendChild(el)
-    } else if (g.em !== undefined || g.emU !== undefined) {
-      const el = document.createElement('em')
-      el.textContent = g.em ?? g.emU ?? ''
-      parent.appendChild(el)
-    } else if (g.code !== undefined) {
-      const el = document.createElement('code')
-      el.textContent = g.code
-      parent.appendChild(el)
-    } else if (g.strike !== undefined) {
-      const el = document.createElement('s')
-      el.textContent = g.strike
-      parent.appendChild(el)
-    } else if (g.alt !== undefined) {
-      const img = document.createElement('img')
-      img.src = resolveImageSrc(g.src ?? '', base)
-      img.alt = g.alt
-      parent.appendChild(img)
-    } else if (g.linkText !== undefined) {
-      const el = document.createElement('a')
-      el.textContent = g.linkText || g.href || ''
-      const href = (g.href ?? '').trim()
-      if (/^https?:\/\//i.test(href)) el.setAttribute('href', href)
-      parent.appendChild(el)
-    } else if (/^<br/i.test(match[0])) {
-      parent.appendChild(document.createElement('br'))
-    }
-    last = match.index + match[0].length
-  }
-  if (last < text.length) parent.appendChild(document.createTextNode(text.slice(last)))
-}
-
-function collectTables(state: EditorState, ranges: DecorationRange[], front: Range | null): void {
-  iterateContent(state, front, (node) => {
-      if (node.name !== 'Table') return
-      // 光标在表格里就退回源码：改表格就是改文字（#153）
-      if (isBlockActive(state, node.from, node.to)) {
-        pushBlockLines(state, node.from, node.to, 'cm-md-table', ranges)
-        return false
-      }
-      ranges.push({
-        from: node.from,
-        to: node.to,
-        deco: Decoration.replace({
-          widget: new TableWidget(
-            state.doc.sliceString(node.from, node.to),
-            state.field(documentFileUrlField, false) ?? documentFileUrl,
-            node.from,
-            node.to
-          )
-        }),
-      })
-      return false
-  })
 }
 
 // ─── 链接 ────────────────────────────────────────────────────────────────────
@@ -1287,7 +1105,6 @@ function buildDecorations(state: EditorState, flash: { from: number; to: number 
   collectPages(state, ranges, front)
   collectInline(state, ranges, front)
   collectFrontmatter(state, ranges, front)
-  collectTables(state, ranges, front)
   collectTaskItems(state, ranges, front)
   collectMermaid(state, ranges, front)
   collectHighlight(state, ranges, excluded)
