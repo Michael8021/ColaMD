@@ -306,6 +306,20 @@
   margin: 0.25em 0;
 }
 
+/* 引用里的表格外框带着引用竖线，上下留白改用内边距，竖线才不会在表格上下断开 */
+.cm-content .cm-md-table-widget.cm-md-blockquote {
+  margin-block: 0;
+  padding-block: 0.25em;
+}
+
+/* 块级留白会被 CM 单独包成外框片段，它不参与表格布局。
+ * 保留只含 cm-gap 的虚拟行片段，避免长表格滚动时失去原有尺寸。 */
+.cm-content .cm-md-table-widget:not(:has(> .cm-line, > .cm-gap)) {
+  display: block;
+  margin: 0;
+  padding: 0;
+}
+
 .cm-content .cm-md-table-row {
   display: table-row;
   border-left: none;
@@ -326,9 +340,20 @@
 
 .cm-content .cm-md-table-cell[data-column="0"] { border-left: 1px solid var(--border-color); }
 
+/* 表头底色和代码块一样画在 z-index -3 的伪元素上，选区层（-2）才看得见。
+ * 用 ::after：引用行的底色占着 ::before。 */
 .cm-content .cm-md-table-header {
-  background: var(--table-header-bg);
+  position: relative;
   font-weight: 600;
+}
+
+.cm-content .cm-md-table-header::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -3;
+  background: var(--table-header-bg);
+  pointer-events: none;
 }
 
 .cm-content .cm-md-table-header .cm-md-table-cell { border-top: 1px solid var(--border-color); }

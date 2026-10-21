@@ -1393,8 +1393,7 @@ function main() {
         `选中=${JSON.stringify(drags.paragraph.text.slice(0, 60))}`)
       check('拖选引用块的文字能选中（2026-10-08 报）', (drags.quote.text ?? '').includes('引用文字'),
         `选中=${JSON.stringify(drags.quote.text.slice(0, 60))}`)
-      // 表格是替换 widget，预览不参与选择模型（#141）。这条断言记的是现状：哪一天表格里的文字能拖选了，
-      // 它会红，那就是该换断言的时候。行内 HTML 上色那一条也是同一个写法。
+      // 直接编辑的表格也必须支持浏览器原生拖选。
       check('拖选表格里的文字', (drags.table.text ?? '').includes('列甲'),
         `选中=${JSON.stringify(drags.table.text.slice(0, 60))}`)
       check('拖选代码块里的文字', (drags.code.text ?? '').includes('const answer'),

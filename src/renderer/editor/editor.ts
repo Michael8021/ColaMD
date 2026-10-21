@@ -544,6 +544,11 @@ export function getEditorView(): EditorView | null {
   return handle?.getView() ?? null
 }
 
+/** 换主题后调用：主题只换了 body 上的类，CodeMirror 自己察觉不到字体变了。 */
+export function remeasureEditor(): void {
+  handle?.remeasure()
+}
+
 /**
  * 编辑器的滚动容器。
  *

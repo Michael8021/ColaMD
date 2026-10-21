@@ -1,5 +1,5 @@
-import { Annotation, EditorSelection, EditorState, Prec, StateEffect, StateField, type ChangeSpec, type Range } from '@codemirror/state'
-import { BlockWrapper, Decoration, EditorView, ViewPlugin, WidgetType, keymap } from '@codemirror/view'
+import { Annotation, EditorSelection, EditorState, Prec, StateEffect, StateField, type ChangeSpec, type Line, type Range, type Transaction, type TransactionSpec } from '@codemirror/state'
+import { BlockWrapper, Decoration, EditorView, ViewPlugin, WidgetType, keymap, type Rect, type ViewUpdate } from '@codemirror/view'
 import { syntaxTree } from '@codemirror/language'
 import type { SyntaxNode } from '@lezer/common'
 import { frontmatterRange } from './math-scan'
@@ -7,8 +7,13 @@ import { isChinese } from '../ui-language'
 import { livePreviewField } from './live-preview'
 
 export interface TableCell {
+  /** 含两侧竖线的整格 */
   from: number
   to: number
+  /** 竖线之间 */
+  left: number
+  right: number
+  /** 去掉首尾空白后的内容 */
   start: number
   end: number
 }
@@ -27,6 +32,9 @@ export interface MarkdownTable {
   delimiter: TableRow
   align: string[]
 }
+
+/** 数字与金额：不拆行，算最小列宽时按整段计 */
+const NUMERIC = /^[+-]?\d[\d,.]*%?$/
 
 const tableCache = new WeakMap<EditorState['doc'], Map<string, MarkdownTable>>()
 
@@ -49,7 +57,7 @@ function readRow(state: EditorState, node: SyntaxNode): TableRow {
     const value = text.slice(left, right)
     const start = left + (value.match(/^[ \t]*/)?.[0].length ?? 0)
     const end = Math.max(start, right - (value.match(/[ \t]*$/)?.[0].length ?? 0))
-    return { from: node.from + from, to: node.from + to, start: node.from + start, end: node.from + end }
+    return { from: node.from + from, to: node.from + to, left: node.from + left, right: node.from + right, start: node.from + start, end: node.from + end }
   })
   return { from: node.from, to: node.to, cells, trailing }
 }
@@ -75,6 +83,19 @@ export function readTable(state: EditorState, node: SyntaxNode): MarkdownTable {
   return table
 }
 
+/** 分隔符不参与表格布局，但选区仍需要它的坐标。用相邻格子的边界代替隐藏元素的空矩形。 */
+class TableBoundary extends WidgetType {
+  constructor(readonly column: number, readonly end = false) { super() }
+  eq(other: TableBoundary): boolean { return this.column === other.column && this.end === other.end }
+  toDOM(): HTMLElement { return document.createElement('span') }
+  coordsAt(dom: HTMLElement): Rect | null {
+    const cell = dom.closest('.cm-md-table-row')?.querySelector<HTMLElement>(`.cm-md-table-cell[data-column="${this.column}"]`)
+    if (!cell) return null
+    const rect = cell.getBoundingClientRect()
+    const x = this.end ? rect.right : rect.left
+    return { left: x, right: x, top: rect.top, bottom: rect.bottom }
+  }
+}
 
 class EmptyTableCell extends WidgetType {
   constructor(readonly column: number, readonly align: string, readonly allowInput = true) { super() }
@@ -129,69 +150,125 @@ class EmptyTableCell extends WidgetType {
   }
 }
 
-function tableDecorations(state: EditorState) {
-  const ranges: { from: number; to: number; deco: Decoration }[] = []
-  const wrappers: Range<BlockWrapper>[] = []
-  const front = frontmatterRange(state.doc.toString())
-  const editable = state.facet(EditorView.editable) && !state.readOnly
-  syntaxTree(state).iterate({ enter: (node) => {
+type DecorationRange = { from: number; to: number; deco: Decoration }
+
+function eachTable(state: EditorState, visit: (node: SyntaxNode) => void): void {
+  const front = state.doc.sliceString(0, 3) === '---' ? frontmatterRange(state.doc.toString()) : null
+  syntaxTree(state).iterate({ enter: node => {
     if (front && node.name !== 'Document' && node.from >= front.from && node.from < front.to) return false
     if (node.name !== 'Table') return
-    const table = readTable(state, node.node)
-    const columns = table.align.length
-    const first = state.doc.lineAt(table.from).from
+    visit(node.node)
+    return false
+  } })
+}
+
+function tableWrappers(state: EditorState) {
+  const wrappers: Range<BlockWrapper>[] = []
+  eachTable(state, node => {
+    const first = state.doc.lineAt(node.from).from
     const classes: string[] = []
     state.field(livePreviewField).between(first, first, (_from, _to, deco) => {
       classes.push(...(deco.spec.class ?? '').split(' ').filter((name: string) => name.startsWith('cm-md-page-') || name === 'cm-md-blockquote' || /^cm-md-li(?:-\d+)?$/.test(name)))
     })
-    wrappers.push(BlockWrapper.create({ tagName: 'div', attributes: { class: `cm-md-table-widget ${classes.join(' ')}`, role: 'table' } }).range(first, table.to))
-    table.rows.forEach((row, rowIndex) => {
-      const line = state.doc.lineAt(row.from)
-      ranges.push({ from: line.from, to: line.from, deco: Decoration.line({
-        class: `cm-md-table-row${rowIndex === 0 ? ' cm-md-table-header' : ''}${rowIndex === table.rows.length - 1 ? ' cm-md-table-last' : ''}`,
-        attributes: { 'data-table-from': String(table.from), 'data-table-row': String(rowIndex), role: 'row' },
-      }) })
-      row.cells.forEach((cell, column) => {
-        if (column >= columns) {
-          ranges.push({ from: cell.from, to: cell.to, deco: Decoration.mark({ class: 'cm-md-table-marker' }) })
-          return
-        }
-        if (cell.start === cell.end) {
-          const widget = new EmptyTableCell(column, table.align[column], editable)
-          ranges.push({ from: cell.from, to: cell.to, deco: cell.from < cell.to ? Decoration.replace({ widget }) : Decoration.widget({ widget, side: 1 }) })
-          return
-        }
-        const numeric = /^[+-]?\d[\d,.]*%?$/.test(state.sliceDoc(cell.start, cell.end))
-        ranges.push({ from: cell.from, to: cell.to, deco: Decoration.mark({ class: `cm-md-table-cell${numeric ? ' cm-md-table-number' : ''}`, attributes: { 'data-column': String(column), role: rowIndex === 0 ? 'columnheader' : 'cell', style: `text-align:${table.align[column]}` } }) })
-        const left = cell.from + (state.sliceDoc(cell.from, cell.from + 1) === '|' ? 1 : 0)
-        const right = cell.to - (row.trailing && column === row.cells.length - 1 ? 1 : 0)
-        if (left > cell.from) ranges.push({ from: cell.from, to: left, deco: Decoration.replace({}) })
-        if (right < cell.to) ranges.push({ from: right, to: cell.to, deco: Decoration.replace({}) })
-        if (cell.start > left) ranges.push({ from: left, to: cell.start, deco: Decoration.mark({ class: 'cm-md-table-padding' }) })
-        if (cell.end < right) ranges.push({ from: cell.end, to: right, deco: Decoration.mark({ class: 'cm-md-table-padding' }) })
-        const content = state.sliceDoc(cell.start, cell.end)
-        for (const match of content.matchAll(/\\[\\|]/g)) {
-          const from = cell.start + match.index!
-          ranges.push({ from, to: from + 1, deco: Decoration.replace({}) })
-        }
-      })
-      for (let column = row.cells.length; column < columns; column++) {
-        ranges.push({ from: row.to, to: row.to, deco: Decoration.widget({ widget: new EmptyTableCell(column, table.align[column], editable), side: column + 1 }) })
-      }
-    })
+    wrappers.push(BlockWrapper.create({ tagName: 'div', attributes: { class: `cm-md-table-widget ${classes.join(' ')}`, 'data-table-from': String(node.from), role: 'table' } }).range(first, node.to))
+  })
+  return BlockWrapper.set(wrappers, true)
+}
+
+function decorateRow(state: EditorState, row: TableRow, rowIndex: number, align: string[], last: boolean,
+  ranges: DecorationRange[], prefixes: Range<Decoration>[]): void {
+  const columns = align.length
+  const editable = state.facet(EditorView.editable) && !state.readOnly
+  const line = state.doc.lineAt(row.from)
+  ranges.push({ from: line.from, to: line.from, deco: Decoration.line({
+    class: `cm-md-table-row${rowIndex === 0 ? ' cm-md-table-header' : ''}${last ? ' cm-md-table-last' : ''}`,
+    attributes: { 'data-table-row': String(rowIndex), role: 'row' },
+  }) })
+  if (line.from < row.from) prefixes.push(Decoration.replace({ widget: new TableBoundary(0) }).range(line.from, row.from))
+  row.cells.forEach((cell, column) => {
+    if (column >= columns) {
+      ranges.push({ from: cell.from, to: cell.to, deco: Decoration.mark({ class: 'cm-md-table-marker' }) })
+      return
+    }
+    if (cell.start === cell.end) {
+      const widget = new EmptyTableCell(column, align[column], editable)
+      ranges.push({ from: cell.from, to: cell.to, deco: cell.from < cell.to ? Decoration.replace({ widget }) : Decoration.widget({ widget, side: 1 }) })
+      return
+    }
+    const numeric = NUMERIC.test(state.sliceDoc(cell.start, cell.end))
+    ranges.push({ from: cell.from, to: cell.to, deco: Decoration.mark({ class: `cm-md-table-cell${numeric ? ' cm-md-table-number' : ''}`, attributes: { 'data-column': String(column), role: rowIndex === 0 ? 'columnheader' : 'cell', style: `text-align:${align[column]}` } }) })
+    const { left, right } = cell
+    if (left > cell.from) ranges.push({ from: cell.from, to: left, deco: Decoration.replace({ widget: new TableBoundary(column) }) })
+    if (right < cell.to) ranges.push({ from: right, to: cell.to, deco: Decoration.replace({ widget: new TableBoundary(column, true) }) })
+    if (cell.start > left) ranges.push({ from: left, to: cell.start, deco: Decoration.mark({ class: 'cm-md-table-padding' }) })
+    if (cell.end < right) ranges.push({ from: cell.end, to: right, deco: Decoration.mark({ class: 'cm-md-table-padding' }) })
+    const content = state.sliceDoc(cell.start, cell.end)
+    for (const match of content.matchAll(/\\[\\|]/g)) {
+      const from = cell.start + match.index!
+      ranges.push({ from, to: from + 1, deco: Decoration.replace({}) })
+    }
+  })
+  for (let column = row.cells.length; column < columns; column++) {
+    ranges.push({ from: row.to, to: row.to, deco: Decoration.widget({ widget: new EmptyTableCell(column, align[column], editable), side: column + 1 }) })
+  }
+}
+
+function tableDecorations(state: EditorState) {
+  const ranges: DecorationRange[] = []
+  const prefixes: Range<Decoration>[] = []
+  eachTable(state, node => {
+    const table = readTable(state, node)
+    table.rows.forEach((row, index) => decorateRow(state, row, index, table.align, index === table.rows.length - 1, ranges, prefixes))
     const delimiter = state.doc.lineAt(table.delimiter.from)
     ranges.push({ from: delimiter.from, to: delimiter.from, deco: Decoration.line({ class: 'cm-md-table-delimiter' }) })
-    return false
-  } })
-  return { decorations: Decoration.set(ranges.map(range => range.deco.range(range.from, range.to)), true), wrappers: BlockWrapper.set(wrappers, true) }
+  })
+  return { decorations: Decoration.set(ranges.map(range => range.deco.range(range.from, range.to)), true), prefixes: Decoration.set(prefixes, true), wrappers: tableWrappers(state) }
+}
+
+/** 只优化同一数据行里的普通文字编辑；结构变化和解析推进仍完整重建。 */
+function changedTableRow(tr: Transaction): { before: SyntaxNode; after: SyntaxNode } | null {
+  const edits: { from: number; to: number; next: number; plain: boolean }[] = []
+  tr.changes.iterChanges((from, to, next, _end, inserted) => {
+    edits.push({ from, to, next, plain: !/[|\\\r\n]/.test(tr.startState.sliceDoc(from, to) + inserted.toString()) })
+  })
+  if (edits.length !== 1 || !edits[0].plain) return null
+  const { from, to, next } = edits[0]
+  const rowAt = (state: EditorState, pos: number) => {
+    let node: SyntaxNode | null = syntaxTree(state).resolveInner(pos, 1)
+    while (node && node.name !== 'TableRow' && node.name !== 'Table') node = node.parent
+    return node?.name === 'TableRow' ? node : null
+  }
+  const before = rowAt(tr.startState, from), after = rowAt(tr.state, next)
+  if (!before || !after || to > before.to || from < before.from || next < after.from) return null
+  if (tr.changes.mapPos(before.parent!.from) !== after.parent!.from || tr.changes.mapPos(before.parent!.to) !== after.parent!.to) return null
+  return { before, after }
 }
 
 const tableField = StateField.define<ReturnType<typeof tableDecorations>>({
   create: tableDecorations,
   update(value, tr) {
-    return tr.docChanged || syntaxTree(tr.startState) !== syntaxTree(tr.state) || tr.startState.facet(EditorView.editable) !== tr.state.facet(EditorView.editable) || tr.startState.readOnly !== tr.state.readOnly ? tableDecorations(tr.state) : value
+    if (tr.startState.facet(EditorView.editable) !== tr.state.facet(EditorView.editable) || tr.startState.readOnly !== tr.state.readOnly) return tableDecorations(tr.state)
+    if (!tr.docChanged) return syntaxTree(tr.startState) !== syntaxTree(tr.state) ? tableDecorations(tr.state) : value
+    const changed = changedTableRow(tr)
+    if (!changed) return tableDecorations(tr.state)
+    const from = tr.state.doc.lineAt(changed.after.from).from, to = changed.after.to
+    const ranges: DecorationRange[] = [], prefixes: Range<Decoration>[] = []
+    let index = 0
+    const previous = tr.startState.doc.lineAt(changed.before.from).from
+    value.decorations.between(previous, previous, (_from, _to, deco) => {
+      if (deco.spec.attributes?.['data-table-row']) index = Number(deco.spec.attributes['data-table-row'])
+    })
+    const table = readTable(tr.startState, changed.before.parent!)
+    decorateRow(tr.state, readRow(tr.state, changed.after), index, table.align, index === table.rows.length - 1, ranges, prefixes)
+    const filter = (start: number) => start < from || start > to
+    return {
+      decorations: value.decorations.map(tr.changes).update({ filterFrom: from, filterTo: to, filter, add: ranges.map(range => range.deco.range(range.from, range.to)), sort: true }),
+      prefixes: value.prefixes.map(tr.changes).update({ filterFrom: from, filterTo: to, filter, add: prefixes, sort: true }),
+      wrappers: tableWrappers(tr.state),
+    }
   },
-  provide: field => [EditorView.outerDecorations.from(field, value => value.decorations), EditorView.blockWrappers.from(field, value => value.wrappers)],
+  // 表格前缀的坐标优先于通用的引用、列表标记隐藏规则；单元格仍包在行内装饰外面
+  provide: field => [EditorView.outerDecorations.from(field, value => value.decorations), Prec.high(EditorView.decorations.from(field, value => value.prefixes)), EditorView.blockWrappers.from(field, value => value.wrappers)],
 })
 
 let tableLayoutId = 0
@@ -216,9 +293,11 @@ const tableLayout = ViewPlugin.fromClass(class {
     this.schedule()
   }
 
-  update(update: { docChanged: boolean; viewportChanged: boolean; geometryChanged: boolean }): void {
+  update(update: ViewUpdate): void {
+    const reconfigured = update.transactions.some(tr => tr.reconfigured)
+    if (reconfigured) this.signature = ''
     if (update.docChanged) this.rules.clear()
-    if (update.docChanged || update.viewportChanged || update.geometryChanged) this.schedule()
+    if (reconfigured || update.docChanged || update.viewportChanged || update.geometryChanged) this.schedule()
   }
 
   private content(cell: TableCell): HTMLElement {
@@ -264,7 +343,7 @@ const tableLayout = ViewPlugin.fromClass(class {
       const pending = new Map<string, { cell: TableCell; header: boolean; font: string }>()
       const tables = new Map<MarkdownTable, number>()
       view.contentDOM.querySelectorAll<HTMLElement>('.cm-md-table-row').forEach(row => {
-        const table = tableAt(view.state, Number(row.dataset.tableFrom))
+        const table = tableAt(view.state, Number(row.closest<HTMLElement>('.cm-md-table-widget')!.dataset.tableFrom))
         if (!table || tables.has(table)) return
         const wrapper = row.closest<HTMLElement>('.cm-md-table-widget')!
         const wrapperStyle = getComputedStyle(wrapper)
@@ -285,7 +364,7 @@ const tableLayout = ViewPlugin.fromClass(class {
           if (!metric && !/[\*_~`\[\]<>$\\&]/.test(text)) {
             this.canvas.font = font
             const measured = this.canvas.measureText(text).width + (parseFloat(style.letterSpacing) || 0) * text.length
-            metric = { min: /^[+-]?\d[\d,.]*%?$/.test(text) ? measured : 0, max: measured }
+            metric = { min: NUMERIC.test(text) ? measured : 0, max: measured }
             this.metrics.set(key, metric)
           }
           if (!metric) {
@@ -309,7 +388,7 @@ const tableLayout = ViewPlugin.fromClass(class {
       if (!plan || plan.doc !== this.view.state.doc) return
       for (const layout of plan.layouts) {
         this.layouts.set(layout.table, layout)
-        this.rules.set(layout.table.from, layout.columns.map((width, column) => `[data-table-layout="${this.id}"] .cm-md-table-row[data-table-from="${layout.table.from}"] .cm-md-table-cell[data-column="${column}"]{width:${width}px}`).join('\n'))
+        this.rules.set(layout.table.from, layout.columns.map((width, column) => `[data-table-layout="${this.id}"] [data-table-from="${layout.table.from}"] .cm-md-table-cell[data-column="${column}"]{width:${width}px}`).join('\n'))
       }
       const css = [...this.rules.values()].join('\n')
       if (this.style.textContent !== css) this.style.textContent = css
@@ -383,7 +462,7 @@ function selectCell(view: EditorView, table: MarkdownTable, row: number, column:
     const focus = () => {
       const hint = view.state.field(virtualCell)
       if (hint?.row !== target.from || hint.column !== column || !view.dom.contains(document.activeElement)) return
-      view.contentDOM.querySelector<HTMLElement>(`[data-table-row="${row}"][data-table-from="${table.from}"] [data-column="${column}"] .cm-md-table-input`)?.focus()
+      view.contentDOM.querySelector<HTMLElement>(`[data-table-from="${table.from}"] [data-table-row="${row}"] [data-column="${column}"] .cm-md-table-input`)?.focus()
     }
     focus()
     requestAnimationFrame(focus)
@@ -415,28 +494,39 @@ function insertRow(view: EditorView, below = true): boolean {
   return true
 }
 
+/** 空行。引用里的空行只剩 `>`。 */
+const blankLine = (text: string) => /^[\s>]*$/.test(text)
+
+/** 行里正文开始的地方：跳过引用、列表与标题的标记，免得字打进被藏起来的标记前面。 */
+const textStart = (line: Line) => line.from + /^[ \t>]*(?:(?:[-*+]|\d+[.)]|#{1,6})[ \t]+)?/.exec(line.text)![0].length
+
 /**
- * 光标离开表格。
+ * 光标离开 [from, to] 这张表格的落点。
  *
- * 紧挨着表格的下一行一打字就会被并进表格当一行，所以向下离开要落在隔着空行的地方。
- * 表格贴着文档开头或结尾、外面没有这样的位置时补一个空段落，和末行按 Enter 离开一样，可撤销。
+ * 紧挨着表格下面的一行一打字就会被并进表格当一行，所以要落在隔着空行的地方：
+ * 向下是下一块的开头，向上是上一块的末尾，和渲染后看到的「上一段 / 下一段」一致。
+ * 表格贴着文档开头或结尾、外面没有这样的位置时补一个空段落，可撤销。
  */
-function leaveTable(view: EditorView, table: MarkdownTable, direction: number): void {
-  const { doc } = view.state
-  const start = doc.lineAt(table.from).from
-  const edit = { annotations: tableEdit.of(true), userEvent: 'input', scrollIntoView: true }
+function exitTable(state: EditorState, from: number, to: number, direction: number): TransactionSpec {
+  const { doc } = state
   if (direction < 0) {
-    if (start > 0) view.dispatch({ selection: { anchor: start - 1 }, scrollIntoView: true })
-    else view.dispatch({ changes: { from: 0, insert: '\n\n' }, selection: { anchor: 0 }, ...edit })
-    return
+    const first = doc.lineAt(from)
+    const above = first.number > 1 ? doc.line(first.number - 1) : null
+    if (above && !blankLine(above.text)) return { selection: { anchor: above.to } }
+    if (above && above.number > 1) return { selection: { anchor: doc.line(above.number - 1).to } }
+    return { changes: { from: 0, insert: above ? '\n' : '\n\n' }, selection: { anchor: 0 } }
   }
-  const after = table.to < doc.length ? doc.lineAt(table.to + 1) : null
-  if (after && (after.length > 0 || after.number < doc.lines)) {
-    view.dispatch({ selection: { anchor: after.from }, scrollIntoView: true })
-    return
-  }
-  const insert = after ? '\n' : '\n\n'
-  view.dispatch({ changes: { from: doc.length, insert }, selection: { anchor: doc.length + insert.length }, ...edit })
+  const last = doc.lineAt(to)
+  const below = last.number < doc.lines ? doc.line(last.number + 1) : null
+  if (below && !blankLine(below.text)) return { selection: { anchor: textStart(below) } }
+  if (below && below.number < doc.lines) return { selection: { anchor: textStart(doc.line(below.number + 1)) } }
+  const insert = below ? '\n' : '\n\n'
+  return { changes: { from: doc.length, insert }, selection: { anchor: doc.length + insert.length } }
+}
+
+function leaveTable(view: EditorView, table: MarkdownTable, direction: number): void {
+  const exit = exitTable(view.state, table.from, table.to, direction)
+  view.dispatch({ ...exit, annotations: tableEdit.of(true), userEvent: exit.changes ? 'input' : 'select', scrollIntoView: true })
 }
 
 function navigate(view: EditorView, direction: number, vertical = false): boolean {
@@ -444,9 +534,11 @@ function navigate(view: EditorView, direction: number, vertical = false): boolea
   if (!current) return false
   const { table, row, column } = current
   if (vertical && direction > 0 && row > 0 && row === table.rows.length - 1 && table.rows[row].cells.every(cell => cell.start === cell.end)) {
-    const from = view.state.doc.lineAt(table.rows[row].from).from - 1
-    const insert = table.to === view.state.doc.length ? '\n\n' : ''
-    view.dispatch({ changes: { from, to: table.to, insert }, selection: { anchor: from + (insert.length || 1) }, annotations: tableEdit.of(true), userEvent: 'input', scrollIntoView: true })
+    // 空末行按 Enter：删掉这一行，再按向下离开的规则落脚，一步撤销
+    const remove = { changes: { from: view.state.doc.lineAt(table.rows[row].from).from - 1, to: table.to } }
+    const removed = view.state.update(remove).state
+    const end = remove.changes.from
+    view.dispatch(view.state.update(remove, { ...exitTable(removed, table.from, end, 1), sequential: true, annotations: tableEdit.of(true), userEvent: 'input', scrollIntoView: true }))
     return true
   }
   const index = row * table.align.length + column + (vertical ? direction * table.align.length : direction)
@@ -465,15 +557,9 @@ function cellText(text: string): string {
   return text.replace(/\r\n?|\n/g, '<br>').replace(/(\\*)\|/g, (match, slashes: string) => slashes.length % 2 ? match : `${slashes}\\|`)
 }
 
-type CurrentCell = NonNullable<ReturnType<typeof currentCell>>
-
-/** 选区是否整个落在当前格里（不含两侧的竖线）。还没写进原文的格子只认空光标。 */
-function withinCell(state: EditorState, current: CurrentCell, from: number, to: number): boolean {
-  const { table, row, column, cell } = current
-  if (!cell) return from === to
-  const left = cell.from + (state.sliceDoc(cell.from, cell.from + 1) === '|' ? 1 : 0)
-  const right = cell.to - (column === table.rows[row].cells.length - 1 && table.rows[row].trailing ? 1 : 0)
-  return from >= left && to <= right
+/** 选区是否整个落在格里（不含两侧的竖线）。还没写进原文的格子只认空光标。 */
+function withinCell(cell: TableCell | undefined, from: number, to: number): boolean {
+  return cell ? from >= cell.left && to <= cell.right : from === to
 }
 
 function insertCellText(view: EditorView, from: number, to: number, text: string): boolean {
@@ -481,7 +567,14 @@ function insertCellText(view: EditorView, from: number, to: number, text: string
   if (!current || !view.state.facet(EditorView.editable) || view.state.readOnly) return false
   const { table, row, column, cell } = current
   if (cell) {
-    if (!withinCell(view.state, current, from, to)) return false
+    if (!withinCell(cell, from, to)) return false
+    if (cell.start === cell.end && cell.left < cell.right) {
+      // 只有空格的格子：写成 `| 内容 |`，不把字贴在右边的竖线上
+      const value = cellText(text)
+      const insert = ` ${value}${view.state.sliceDoc(cell.right, cell.right + 1) === '|' ? ' ' : ''}`
+      view.dispatch({ changes: { from: cell.left, to: cell.right, insert }, selection: { anchor: cell.left + 1 + value.length }, annotations: tableEdit.of(true), userEvent: 'input.type' })
+      return true
+    }
     const escaped = cellText(view.state.sliceDoc(cell.start, from) + text).slice(from - cell.start)
     if (escaped === text && cell.start !== cell.end) return false
     view.dispatch({ changes: { from, to, insert: escaped }, selection: { anchor: from + escaped.length }, annotations: tableEdit.of(true), userEvent: 'input.type' })
@@ -533,7 +626,7 @@ function cellAtPoint(view: EditorView, event: Pick<MouseEvent, 'clientX' | 'clie
   const element = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>('.cm-md-table-cell')
   const row = element?.closest<HTMLElement>('.cm-md-table-row')
   if (!element || !row) return null
-  const table = tableAt(view.state, Number(row.dataset.tableFrom))
+  const table = tableAt(view.state, Number(row.closest<HTMLElement>('.cm-md-table-widget')!.dataset.tableFrom))
   const sourceRow = table?.rows[Number(row.dataset.tableRow)]
   if (!sourceRow) return null
   const cell = sourceRow.cells[Number(element.dataset.column)]
@@ -554,7 +647,7 @@ function moveVertical(view: EditorView, direction: 1 | -1, extend = false): bool
   const range = view.state.selection.main
   const caret = view.coordsAtPos(range.head)
   const edge = cell && view.coordsAtPos(direction < 0 ? cell.start : cell.end, direction)
-  const element = (r: number) => view.contentDOM.querySelector<HTMLElement>(`[data-table-from="${table.from}"][data-table-row="${r}"] [data-column="${column}"]`)
+  const element = (r: number) => view.contentDOM.querySelector<HTMLElement>(`[data-table-from="${table.from}"] [data-table-row="${r}"] [data-column="${column}"]`)
   const own = element(row)
   const lineHeight = own ? Number.parseFloat(getComputedStyle(own).lineHeight) : 0
   let pos: number | null = null
@@ -701,16 +794,15 @@ export const tableEditing = [
       const cell = event.target.closest<HTMLElement>('.cm-md-table-cell')
       const row = cell?.closest<HTMLElement>('.cm-md-table-row')
       if (!cell || !row) return false
-      const table = tableAt(view.state, Number(row.dataset.tableFrom))
+      const table = tableAt(view.state, Number(row.closest<HTMLElement>('.cm-md-table-widget')!.dataset.tableFrom))
       if (!table) return false
       const rowIndex = Number(row.dataset.tableRow)
       const column = Number(cell.dataset.column)
       const target = table.rows[rowIndex].cells[column]
-      const pos = view.posAtCoords({ x: event.clientX, y: event.clientY })
       if (target && target.start !== target.end) return false
       event.preventDefault()
       if (target) {
-        const anchor = Math.max(target.start, Math.min(target.end, pos ?? target.start))
+        const anchor = Math.max(target.start, Math.min(target.end, view.posAtCoords({ x: event.clientX, y: event.clientY }) ?? target.start))
         view.dispatch({ selection: { anchor }, effects: setVirtualCell.of({ row: table.rows[rowIndex].from, column }) })
       } else selectCell(view, table, rowIndex, column, false)
       const input = cell.querySelector<HTMLElement>('.cm-md-table-input')
@@ -731,7 +823,7 @@ export const tableEditing = [
       }
       // 选区伸到格外（从正文拖进表格、全选）时不当表格数据展开，交给常规粘贴
       const { from, to } = view.state.selection.main
-      if (!withinCell(view.state, current, from, to)) return false
+      if (!withinCell(current.cell, from, to)) return false
       const { table, row, column } = current
       const values = text.replace(/\r\n?/g, '\n').replace(/\n$/, '').split('\n').map(line => line.split('\t').map(cellText))
       const columns = Math.max(table.align.length, column + Math.max(...values.map(row => row.length)))

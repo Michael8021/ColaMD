@@ -305,6 +305,10 @@ LLM 生成的 Markdown 常常在段落之间留一串空行，读起来松垮。
 
 **Status:** In progress. Table cells stay editable in the rendered layout. The Markdown buffer remains the source of truth: decorations hide the pipes and separator row. Column widths use the contents of the whole table and stay fixed while scrolling; content, font or available-width changes recalculate them. Rows outside the viewport still unload. Tab moves between cells and adds a row at the end; Enter moves down, Mod+Enter inserts a row, and Shift+Enter inserts a line break. Pasted tab-separated data can extend the table. No toolbar is added.
 
+**审阅决定（2026-10-22）：** 普通数据行文字编辑只更新该行装饰，结构变化保留完整重建；主题应用入口统一通知编辑器重测行高和表格列宽，覆盖自定义主题之间的切换。表格外框中的独立留白片段按普通块显示，虚拟行占位继续保留表格布局。
+
+**合并后清理：** #184 单独合并时仍需要 `.cm-line:has(> .cm-md-table-widget)` 这条旧表格选择器，因此本次不修改 #184。只有 #184 与直接编辑表格的结构都进入 main 后，才删除其中的表格选择器分支，保留同组 Mermaid、公式及 HTML 块规则；第二个 PR 合并前 rebase 时复核留白、引用和退出表格的交互。
+
 ### Selectable text inside other rendered blocks (#141)
 
 **Source:** [#141](https://github.com/marswaveai/ColaMD/issues/141)
