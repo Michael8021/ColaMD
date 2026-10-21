@@ -41,18 +41,20 @@ function escapeAttribute(value: string): string {
 
 function lineKind(line: HTMLElement): LineKind {
   const classes = line.classList
+  // 引用排在最前：引用里的标题、列表、代码由 renderGroup 剥掉引用后再按块翻译
+  if (classes.contains('cm-md-blockquote')) return 'quote'
   for (let level = 1; level <= 6; level++) {
     if (classes.contains(`cm-md-atxheading${level}`)) return `h${level}` as LineKind
   }
   if (classes.contains('cm-md-codeblock')) return 'code'
-  if (classes.contains('cm-md-blockquote')) return 'quote'
   if (classes.contains('cm-md-hr')) return 'hr'
   if (line.querySelector('.cm-md-table-widget')) return 'table'
   if (classes.contains('cm-md-frontmatter')) return 'empty'
   for (let depth = 0; depth <= 6; depth++) {
     if (classes.contains(`cm-md-li-${depth}`)) return 'li'
   }
-  if ((line.textContent ?? '').trim() === '' && line.querySelector('img') === null) return 'empty'
+  // cm-widgetBuffer 是 CodeMirror 在隐藏区间旁边垫的占位图，不是内容（引用里的空行 `>` 就带着它）
+  if ((line.textContent ?? '').trim() === '' && line.querySelector('img:not(.cm-widgetBuffer)') === null) return 'empty'
   return 'p'
 }
 
@@ -66,6 +68,8 @@ function listDepth(line: HTMLElement): number {
 
 /** 这一行是不是有序列表（`1.` 这种序号是用户写的，会留在行里）。 */
 function isOrdered(line: HTMLElement): boolean {
+  // 选区从第一项的文字起选时，序号不在选区里，行上的类还在
+  if (line.classList.contains('cm-md-li-ordered')) return true
   const mark = line.querySelector('.cm-md-listmark')
   return !!mark && /^\s*\d+[.)]/.test(mark.textContent ?? '')
 }
@@ -125,7 +129,7 @@ function lineHTML(line: HTMLElement): string {
  */
 function listTag(line: HTMLElement, ordered: boolean): string {
   if (!ordered) return '<ul>'
-  const start = Number.parseInt(line.querySelector('.cm-md-listmark')?.textContent ?? '', 10)
+  const start = Number.parseInt(line.querySelector('.cm-md-listmark')?.textContent ?? line.dataset.listNumber ?? '', 10)
   return Number.isFinite(start) && start !== 1 ? `<ol start="${start}">` : '<ol>'
 }
 
@@ -145,6 +149,12 @@ function renderList(lines: HTMLElement[]): string {
   for (const line of lines) {
     const depth = listDepth(line)
     const ordered = isOrdered(line)
+    // 续行（一项里的第二行起）接在这一项后面，不是新的一项
+    if (!line.classList.contains('cm-md-li-start') && open.length > 0 && open[open.length - 1].depth === depth) {
+      const content = lineHTML(line).replace(/^\s+/, '')
+      if (content.trim() !== '') html += `<br>${content}`
+      continue
+    }
     while (open.length > 0 && open[open.length - 1].depth > depth) {
       html += `</li></${tagOf(open.pop()!.ordered)}>`
     }
@@ -174,6 +184,8 @@ function isCodeFenceEnd(line: HTMLElement): boolean {
 }
 
 function renderCode(lines: HTMLElement[]): string {
+  // 选区只伸进了开头的围栏行：一行代码也没选，不交出一个空代码块
+  if (lines.length === 1 && lines[0].classList.contains('cm-md-codeblock-first') && !lines[0].classList.contains('cm-md-codeblock-last')) return ''
   // 第一行是首行围栏，最后一行是收尾围栏；若选区只截取内部几行，则不截断内容
   let body = lines
   if (body.length > 0 && isCodeFenceStart(body[0])) {
@@ -190,7 +202,13 @@ function renderGroup(kind: LineKind, lines: HTMLElement[]): string {
   if (kind === 'code') return renderCode(lines)
   if (kind === 'li') return renderList(lines)
   if (kind === 'quote') {
-    return `<blockquote>${lines.map((line) => `<p>${lineHTML(line)}</p>`).join('')}</blockquote>`
+    // 引用里还有块（标题、列表、代码）：剥掉引用的类，再按块翻译一遍
+    const inner = lines.map((line) => {
+      const clone = line.cloneNode(true) as HTMLElement
+      clone.classList.remove('cm-md-blockquote')
+      return clone
+    })
+    return `<blockquote>${blocksHTML(inner)}</blockquote>`
   }
   if (kind === 'table') {
     const table = lines[0].querySelector<HTMLElement>('.cm-md-table-widget')

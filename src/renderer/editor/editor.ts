@@ -11,18 +11,17 @@
 
 import { type EditorState, type SelectionRange } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
-import { ensureSyntaxTree } from '@codemirror/language'
 import { createEditorCore, getEditorHandle, type EditorHandle } from './core'
 import { footnoteDefinitions } from './footnotes'
 import { selectionHTMLFrom } from './clean-html'
 import { renderWholeDocument, restoreViewport } from '../print-layout'
 
-import { headingFlashEffect, livePreviewField, setCleanExport as setCleanExportEffect, setDocumentFileUrlEffect, primeDocumentFileUrl } from './live-preview'
+import { headingFlashEffect, setCleanExport as setCleanExportEffect, setDocumentFileUrlEffect, primeDocumentFileUrl } from './live-preview'
 import { runFormatCommand as runFormat, type FormatCommandId } from './format-commands'
 import { isChinese } from '../ui-language'
 import { headingAnchorLine } from './heading-anchor'
 import { isDiagramZoomed } from './mermaid-bridge'
-import { frontmatterRange } from './math-scan'
+import { copiedMarkdown, enclosingForHTML } from './copy-markdown'
 
 // katex 的样式表仍要引，公式 widget 里渲出来的 HTML 靠它排版。
 import 'katex/dist/katex.min.css'
@@ -427,30 +426,32 @@ function selectionRange(view: EditorView, ranges: readonly SelectionRange[]): Ra
 }
 
 function selectionHTML(view: EditorView, ranges: readonly SelectionRange[]): string {
-  return selectionHTMLFrom(selectionRange(view, ranges).cloneContents())
-}
-
-/** 跨行复制从标题开头起选时，把隐藏的行前缀也交给 Markdown 粘贴目标。 */
-function copiedMarkdown(state: EditorState, range: SelectionRange): string {
-  const line = state.doc.lineAt(range.from)
-  let from = range.from
-  // 单行选区仍按文字复制；属性区和代码中的 # 也不能当标题补齐。
-  if (range.to > line.to && range.from >= (frontmatterRange(state.doc.toString())?.to ?? 0)) {
-    let node = ensureSyntaxTree(state, line.to, 50)?.resolveInner(from, 1)
-    while (node && !/^ATXHeading[1-6]$/.test(node.name)) node = node.parent ?? undefined
-    const mark = node?.firstChild
-    if (mark?.name === 'HeaderMark') {
-      let start = mark.to
-      while (start < line.to && /[\t ]/.test(state.sliceDoc(start, start + 1))) start++
-      // 复用实际的隐藏装饰，涵盖加粗、链接、高亮等起始标记。
-      // 不越过有内容的 widget 或任何正文，避免补回刻意没选中的字。
-      state.field(livePreviewField, false)?.between(start, from, (a, b, decoration) => {
-        if (a <= start && b > start && b <= from && decoration.point && !decoration.spec.widget) start = b
-      })
-      if (from <= start) from = line.from
+  const range = selectionRange(view, ranges)
+  const fragment = range.cloneContents()
+  // 整段选区都在里面的引用、列表项、标题不带出来，和原文口味一致（见 copy-markdown.ts）
+  const inside = enclosingForHTML(view.state, ranges[0].from, ranges[ranges.length - 1].to)
+  for (const line of fragment.querySelectorAll<HTMLElement>('.cm-line')) {
+    if (inside.quote) line.classList.remove('cm-md-blockquote')
+    for (const depth of inside.listDepths) {
+      if (line.classList.contains(`cm-md-li-${depth}`)) line.classList.remove('cm-md-li', `cm-md-li-${depth}`, 'cm-md-li-start', 'cm-md-li-ordered')
     }
+    if (inside.heading) for (let level = 1; level <= 6; level++) line.classList.remove(`cm-md-atxheading${level}`)
   }
-  return state.sliceDoc(from, range.to)
+  let content: Node = fragment
+  // 选区整个落在一段格式文字里（只选了加粗的一半）：cloneContents 只给出字，
+  // 外面那几层格式要补回来，和原文口味补上的 `**` 一致。
+  let node: Node | null = range.commonAncestorContainer
+  if (node.nodeType === Node.TEXT_NODE) node = node.parentNode
+  while (node instanceof HTMLElement && !node.classList.contains('cm-line') && view.contentDOM.contains(node) && node !== view.contentDOM) {
+    const shell = node.cloneNode(false)
+    shell.appendChild(content)
+    content = shell
+    node = node.parentNode
+  }
+  if (content instanceof DocumentFragment) return selectionHTMLFrom(content)
+  const wrapped = document.createDocumentFragment()
+  wrapped.appendChild(content)
+  return selectionHTMLFrom(wrapped)
 }
 
 /**

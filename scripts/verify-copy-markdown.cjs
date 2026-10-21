@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// 先 npm run build，再 npx electron scripts/verify-heading-copy.cjs。
+// 先 npm run build，再 npx electron scripts/verify-copy-markdown.cjs。
+// 复制给 Markdown 去处的原文：被选区切开的结构补上标记，整段在里面的块不带出来（见 copy-markdown.ts）。
 // 使用真正的 Electron 窗口和系统复制、粘贴；窗口由 offscreen-window.cjs 隐藏。
 const { app, clipboard, ClipboardItem } = require('electron')
 const assert = require('node:assert/strict')
@@ -16,7 +17,7 @@ async function main() {
   const { assertBuildFresh } = await import('./build-freshness.mjs')
   const { verifyWorkdir } = await import('./verify-workdir.mjs')
   assertBuildFresh()
-  const { dir, udd } = verifyWorkdir('heading-copy')
+  const { dir, udd } = verifyWorkdir('copy-markdown')
   const source = join(dir, 'source.md')
   const destination = join(dir, 'destination.md')
   const initial = '### 复制验收标题\n\n后续正文\n'
@@ -52,7 +53,7 @@ async function finish(code) {
   try {
     if (savedClipboard.length) await clipboard.write(savedClipboard)
   } finally {
-    console.log(`标题复制验收：${checks.filter(c => c.ok).length}/${checks.length} 通过`)
+    console.log(`复制原文验收：${checks.filter(c => c.ok).length}/${checks.length} 通过`)
     app.exit(code)
   }
 }
@@ -163,14 +164,17 @@ async function run(win, files) {
     ['前有正文', '前置正文\n\n### 文中标题', '文中标题', 3],
     ['混合格式', '## **粗体** 与 *斜体*', '粗体', 2],
   ]
+  // 从格式文字中间起选：标题标记不补，但切开的行内格式要补上开标记
+  const midOpeners = { 加粗: '**', 嵌套强调: '***', 删除线: '~~', 行内代码: '`', 链接: '[', 高亮: '==', 高亮嵌套加粗: '==**', 混合格式: '**' }
   for (const [name, heading, title, level] of special) {
+    midOpeners[name] ??= ''
     const doc = `${heading}\n\n后续正文`, from = doc.indexOf(title)
     const lineStart = doc.lastIndexOf('\n', from) + 1
     await sample(`${name} 跨块补齐原始前缀`, doc, from, doc.length, doc.slice(lineStart), level)
-    await sample(`${name} 从正文中间开始不补`, doc, from + 1, doc.length, doc.slice(from + 1), level)
+    const expected = name === '带结束标记' ? '尾标记\n\n后续正文' : midOpeners[name] + doc.slice(from + 1)
+    await sample(`${name} 从正文中间开始不补标题标记`, doc, from + 1, doc.length, expected, level)
   }
   for (const [name, doc, text] of [
-    ['围栏代码', '```md\n### 代码标题\n正文\n```', '代码标题'],
     ['缩进代码', '    ### 缩进代码\n    正文', '缩进代码'],
     ['转义井号', '\\### 转义标题\n\n正文', '转义标题'],
     ['七个井号', '####### 非标题\n\n正文', '非标题'],
@@ -182,6 +186,156 @@ async function run(win, files) {
     ['普通正文', '正文文字\n\n### 后面的标题', '文字'],
     ['可见的引用链接括号', '### [引用文字][ref]\n\n后续正文\n\n[ref]: https://example.com', '引用文字'],
   ]) await sample(`${name} 不补不存在的标题前缀`, doc, doc.indexOf(text), doc.length, doc.slice(doc.indexOf(text)))
+
+  // ⟦ ⟧ 标出选区在原文里的两端。端点故意放在隐藏标记的里侧或外侧，两种都要得到同样的结果。
+  const pick = src => {
+    const from = src.indexOf('⟦'), plain = src.replace('⟦', ''), to = plain.indexOf('⟧')
+    return { doc: plain.replace('⟧', ''), from, to }
+  }
+  const matrix = [
+    // 行内格式：选区停在定界符里侧也要带上完整的一对
+    ['高亮里侧', '正文 ==⟦高亮⟧== 结尾', '==高亮==', '<mark>'],
+    ['高亮外侧', '正文 ⟦==高亮==⟧ 结尾', '==高亮==', '<mark>'],
+    ['高亮左半在外', '正文 ⟦==高亮⟧== 结尾', '==高亮==', '<mark>'],
+    ['高亮切开', '正文 ==高⟦亮==后⟧文', '==亮==后', '<mark>'],
+    ['加粗中间', '**加⟦粗文⟧字**', '**粗文**', '<strong>'],
+    ['加粗开头', '**⟦加粗**后⟧文', '**加粗**后', '<strong>'],
+    ['结束在加粗开标记后', '前⟦文**⟧加粗**', '文'],
+    ['开始在加粗闭标记前', '**加粗⟦**后⟧文', '后'],
+    ['下划线斜体', '_⟦斜体⟧_ 正文', '_斜体_', '<em>'],
+    ['粗斜体', '***⟦粗斜⟧***', '***粗斜***'],
+    ['删除线', '~~⟦删除⟧~~', '~~删除~~', '<s>'],
+    ['行内代码切开', '`co⟦d⟧e`', '`d`', '<code>'],
+    ['链接文字', '见[⟦链接⟧](https://a.com)后', '[链接](https://a.com)'],
+    ['链接切开', '[链⟦接文⟧字](https://a.com "题")', '[接文](https://a.com "题")'],
+    ['链接里的加粗', '[**⟦粗链⟧**](https://a.com)', '[**粗链**](https://a.com)'],
+    ['加粗里的链接', '**[⟦链接](https://a.com)尾⟧巴**', '**[链接](https://a.com)尾**'],
+    ['高亮嵌套加粗切开', '==**强⟦调高⟧亮**==', '==**调高**=='],
+    ['样式标签', '<span style="color:red">⟦红字⟧</span>', '<span style="color:red">红字</span>'],
+    ['跨行带格式', '前文 **加⟦粗\n下一段** 尾⟧', '**粗\n下一段** 尾', '<strong>'],
+    // 标题里只选文字：不带 #，行内格式照带
+    ['标题里的高亮', '### ==⟦高亮标题⟧==', '==高亮标题=='],
+    ['标题里的加粗开头', '## **⟦加粗**标题⟧', '**加粗**标题'],
+    ['标题里的链接开头', '### [⟦链接](https://a.com)标题⟧', '[链接](https://a.com)标题'],
+    ['从行首选整行标题', '⟦### 标题⟧\n\n正文', '标题'],
+    ['带结束标记只选文字', '### ⟦末尾⟧ ###', '末尾'],
+    ['带结束标记选到行尾', '### ⟦末尾 ###⟧', '末尾'],
+    ['带结束标记跨块', '### ⟦末尾 ###\n\n正文⟧', '### 末尾 ###\n\n正文'],
+    // 列表：跨项保留结构，只在一项里选只给文字
+    ['无序列表跨项', '- ⟦苹果\n- 香蕉\n- 橙子⟧', '- 苹果\n- 香蕉\n- 橙子', '<ul>'],
+    ['无序列表一项', '- ⟦苹果⟧\n- 香蕉', '苹果', ['<p>苹果</p>']],
+    ['有序列表跨项', '1. ⟦一\n2. 二⟧', '1. 一\n2. 二', ['<ol><li>一</li><li>二</li></ol>']],
+    ['有序列表从三起', '3. ⟦三\n4. 四⟧', '3. 三\n4. 四', ['<ol start="3"><li>三</li><li>四</li></ol>']],
+    ['待办跨项', '- [ ] ⟦待办一\n- [x] 待办二⟧', '- [ ] 待办一\n- [x] 待办二'],
+    ['待办一项', '- [ ] ⟦待办⟧', '待办'],
+    ['列表项中间起选', '- 苹⟦果\n- 香蕉⟧', '果\n- 香蕉'],
+    ['列表项内续行', '- ⟦甲\n  续行⟧', '甲\n续行', ['!<li>']],
+    ['续行跨到下一项', '- ⟦甲\n  续行\n- 乙⟧', '- 甲\n  续行\n- 乙', ['<ul><li>甲<br>续行</li><li>乙</li></ul>']],
+    ['嵌套列表跨项', '- 甲\n  - ⟦乙\n  - 丙⟧', '- 乙\n- 丙', ['<ul><li>乙</li><li>丙</li></ul>']],
+    ['结束在下一项的标记里', '- ⟦甲\n- ⟧乙', '- 甲\n'],
+    ['列表项开头是加粗', '- **⟦苹果**\n- 香蕉⟧', '- **苹果**\n- 香蕉'],
+    // 引用：整段在引用里不带 >，跨出去保留
+    ['引用里两行', '> ⟦第一行\n> 第二行⟧', '第一行\n第二行', ['!<blockquote>']],
+    ['引用里两段', '> ⟦第一段\n>\n> 第二段⟧', '第一段\n\n第二段', ['!<blockquote>', '<p>第一段</p><p>第二段</p>']],
+    ['引用跨出', '> ⟦引用\n\n正文⟧', '> 引用\n\n正文', ['<blockquote><p>引用</p></blockquote><p>正文</p>']],
+    ['从正文跨进引用', '⟦正文\n\n> 引用⟧', '正文\n\n> 引用'],
+    ['引用里的列表跨项', '> - ⟦甲\n> - 乙⟧', '- 甲\n- 乙', ['!<blockquote>', '<ul><li>甲</li><li>乙</li></ul>']],
+    ['引用里的列表跨出', '> - ⟦甲\n> - 乙\n\n正文⟧', '> - 甲\n> - 乙\n\n正文', ['<blockquote><ul><li>甲</li><li>乙</li></ul></blockquote><p>正文</p>']],
+    ['嵌套引用里', '> > ⟦内一\n> > 内二⟧', '内一\n内二'],
+    ['引用里的标题跨块', '> ### ⟦引用标题\n> 正文⟧', '### 引用标题\n正文', ['!<blockquote>', '<h3>引用标题</h3><p>正文</p>']],
+    // 代码块：在里面只给代码，跨出去补齐围栏
+    ['代码块里多行', '```js\n⟦const a = 1\nconst b = 2⟧\n```', 'const a = 1\nconst b = 2', ['<pre><code>const a = 1\nconst b = 2</code></pre>']],
+    ['代码块里半行', '```js\ncon⟦st⟧ a\n```', 'st'],
+    ['代码块里的井号', '```md\n⟦### 代码标题⟧\n```', '### 代码标题'],
+    ['从代码中间跨出', '```js\nconst ⟦a = 1\n```\n\n正文⟧', '```js\na = 1\n```\n\n正文', '<pre>'],
+    ['从代码行首跨出', '```js\n⟦a\nb\n```\n\n正文⟧', '```js\na\nb\n```\n\n正文'],
+    ['从外面选进代码中间', '⟦正文\n\n```js\na = ⟧1\n```', '正文\n\n```js\na = \n```'],
+    ['从外面选到代码行首', '⟦正文\n\n```js\na\n⟧b\n```', '正文\n\n```js\na\n```'],
+    ['选进代码的围栏行', '⟦正文\n\n```js⟧\na\n```', '正文\n\n', ['!<pre>']],
+    ['选进收尾围栏', '⟦正文\n\n```js\na\n``⟧`', '正文\n\n```js\na\n```'],
+    ['波浪围栏', '~~~~py\n⟦x\n~~~~\n\n尾⟧', '~~~~py\nx\n~~~~\n\n尾'],
+    ['未闭合围栏', '⟦正文\n\n```\na⟧\nb', '正文\n\n```\na\n```'],
+    ['引用里的代码', '> ```js\n> ⟦a\n> b⟧\n> ```', 'a\nb'],
+    ['引用里的代码跨出', '> ```js\n> a⟦b\n> ```\n\n正文⟧', '> ```js\n> b\n> ```\n\n正文', ['<blockquote><pre><code>b</code></pre></blockquote><p>正文</p>']],
+    ['列表里的代码', '- 项\n\n  ```js\n  ⟦a\n  b⟧\n  ```', 'a\nb'],
+    ['两段代码之间', '```js\na⟦1\n```\n\n中间\n\n```py\nb⟧2\n```', '```js\n1\n```\n\n中间\n\n```py\nb\n```'],
+    // 不该动的
+    ['普通段落', '一段⟦正文\n第二⟧行', '正文\n第二'],
+    ['引用链接方括号可见', '[⟦引用⟧][r]\n\n[r]: https://a.com', '引用'],
+    ['只选了隐藏标记', '正文⟦==⟧高亮==', '=='],
+  ]
+  for (const [name, src, expected, html] of matrix) {
+    const { doc, from, to } = pick(src)
+    for (const reverse of [false, true]) {
+      await reset(doc, from, to, reverse)
+      const copied = await copy()
+      check(`${name}${reverse ? '（反向）' : ''}`, () => {
+        assert.equal(copied.text, expected)
+        assert.ok(copied.unchanged, '复制不能修改文档或选区')
+        for (const want of [html ?? []].flat()) {
+          if (want.startsWith('!')) assert.ok(!copied.html.includes(want.slice(1)), copied.html)
+          else assert.ok(copied.html.includes(want), copied.html)
+        }
+      })
+    }
+  }
+
+  // 粘回 ColaMD：系统剪贴板、粘贴、撤销、重做走一遍
+  for (const [name, src, expected] of [
+    ['高亮', '正文 ==⟦高亮⟧== 结尾', '==高亮=='],
+    ['加粗标题开头', '## **⟦加粗**标题⟧\n\n', '**加粗**标题'],
+    ['列表', '- ⟦苹果\n- 香蕉⟧\n\n', '- 苹果\n- 香蕉'],
+    ['代码跨出', '```js\nconst ⟦a\n```\n\n正文⟧', '```js\na\n```\n\n正文'],
+  ]) {
+    const { doc, from, to } = pick(src)
+    await reset(doc, from, to)
+    await key('c', [mod])
+    const nativeText = await clipboard.readText()
+    check(`${name} 系统剪贴板`, () => assert.equal(nativeText, expected))
+    await ev(`v.dispatch({selection:{anchor:v.state.doc.length}});v.focus()`)
+    await key('v', [mod])
+    const pasted = await ev('v.state.doc.toString()')
+    check(`${name} 粘贴`, () => assert.equal(pasted, doc + expected))
+    await key('z', [mod])
+    const undone = await ev('v.state.doc.toString()')
+    check(`${name} 撤销还原原文`, () => assert.equal(undone, doc))
+    await key('z', [mod, 'shift'])
+    const redone = await ev('v.state.doc.toString()')
+    check(`${name} 重做还原粘贴`, () => assert.equal(redone, pasted))
+  }
+
+  // ⌘A：代码块里先选代码，再按一次全文；别处直接全文
+  {
+    const doc = '开头\n\n```js\nconst a = 1\nconst b = 2\n```\n\n> 引用一\n> 引用二\n\n结尾'
+    const codeFrom = doc.indexOf('const a'), codeTo = doc.indexOf('2\n```') + 1
+    const selection = () => ev('[v.state.selection.main.from, v.state.selection.main.to]')
+    await reset(doc, codeFrom + 3, codeFrom + 3)
+    await key('a', [mod])
+    const first = await selection()
+    check('⌘A 在代码块里只选代码', () => assert.deepEqual(first, [codeFrom, codeTo]))
+    const copied = await copy()
+    check('⌘A 选中的代码复制出来没有围栏', () => assert.equal(copied.text, 'const a = 1\nconst b = 2'))
+    await key('a', [mod])
+    const second = await selection()
+    check('再按 ⌘A 选中全文', () => assert.deepEqual(second, [0, doc.length]))
+    await reset(doc, doc.indexOf('```js') + 2, doc.indexOf('```js') + 2)
+    await key('a', [mod])
+    const onFence = await selection()
+    check('⌘A 在围栏行上也只选代码', () => assert.deepEqual(onFence, [codeFrom, codeTo]))
+    await reset(doc, doc.indexOf('引用一') + 1, doc.indexOf('引用一') + 1)
+    await key('a', [mod])
+    const inQuote = await selection()
+    check('⌘A 在引用里选中全文', () => assert.deepEqual(inQuote, [0, doc.length]))
+    await reset(doc, 1, 1)
+    await key('a', [mod])
+    const inText = await selection()
+    check('⌘A 在正文里选中全文', () => assert.deepEqual(inText, [0, doc.length]))
+    const empty = '```\n```\n\n正文'
+    await reset(empty, 2, 2)
+    await key('a', [mod])
+    const onEmpty = await selection()
+    check('⌘A 在空代码块里选中全文', () => assert.deepEqual(onEmpty, [0, empty.length]))
+  }
 
   const themes = ['light', 'dark', 'elegant', 'sepia', 'notion', 'bear', 'writer', 'solarized-dark', 'nord', 'gruvbox', 'dracula', 'midnight']
   for (const theme of themes) {
@@ -257,9 +411,9 @@ async function run(win, files) {
   const sourceText = await clipboard.readText()
   check('源码模式复制不补前缀', () => assert.equal(sourceText, '源码标题\n\n正文'))
 
-  if (checks.some(check => !check.ok)) throw Error('标题复制验收有失败项')
+  if (checks.some(check => !check.ok)) throw Error('复制原文验收有失败项')
 }
 
-const timeout = setTimeout(() => { console.error('标题复制验收超时'); finish(1) }, 90000)
+const timeout = setTimeout(() => { console.error('复制原文验收超时'); finish(1) }, 180000)
 timeout.unref()
 main().catch(error => { console.error(error); finish(1) })

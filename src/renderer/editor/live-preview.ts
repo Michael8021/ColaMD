@@ -68,6 +68,15 @@ function pushBlockLines(
 function pushListItemLines(state: EditorState, node: SyntaxNode, ranges: DecorationRange[]): void {
   const className = `cm-md-li cm-md-li-${Math.min(listDepth(node), 6)}`
   const tree = syntaxTree(state)
+  // 有序与否、每一项从哪一行开始，也记在行上：复制只选到一项的半行时，序号不在选区里，
+  // 富文本那边仍要认得出这是第几项的有序列表，也要分清续行和新的一项。
+  const mark = node.getChild('ListMark')
+  const number = mark && node.parent?.name === 'OrderedList' ? Number.parseInt(state.doc.sliceString(mark.from, mark.to), 10) : NaN
+  const first = state.doc.lineAt(node.from).number
+  const startLine = Decoration.line({
+    class: `${className} cm-md-li-start${Number.isFinite(number) ? ' cm-md-li-ordered' : ''}`,
+    attributes: Number.isFinite(number) ? { 'data-list-number': String(number) } : undefined,
+  })
 
   // 子列表之前的行一定是这一项自己的（包括项里的空行），不用问语法树。
   let ownEnd = node.to
@@ -78,7 +87,6 @@ function pushListItemLines(state: EditorState, node: SyntaxNode, ranges: Decorat
     }
   }
 
-  const first = state.doc.lineAt(node.from).number
   const last = state.doc.lineAt(node.to).number
   for (let n = first; n <= last; n++) {
     const line = state.doc.line(n)
@@ -91,7 +99,7 @@ function pushListItemLines(state: EditorState, node: SyntaxNode, ranges: Decorat
       while (owner && owner.name !== 'ListItem') owner = owner.parent
       if (!owner || owner.from !== node.from) continue
     }
-    ranges.push({ from: line.from, to: line.from, deco: BLOCK(className) })
+    ranges.push({ from: line.from, to: line.from, deco: n === first ? startLine : BLOCK(className) })
   }
 }
 
