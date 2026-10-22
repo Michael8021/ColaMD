@@ -1,4 +1,4 @@
-import { Annotation, EditorSelection, EditorState, Prec, StateEffect, StateField, type ChangeSpec, type Line, type Range, type Transaction, type TransactionSpec } from '@codemirror/state'
+import { Annotation, EditorSelection, EditorState, Prec, StateEffect, StateField, Transaction, type ChangeSpec, type Line, type Range, type TransactionSpec } from '@codemirror/state'
 import { BlockWrapper, Decoration, EditorView, ViewPlugin, WidgetType, keymap, type Rect, type ViewUpdate } from '@codemirror/view'
 import { syntaxTree } from '@codemirror/language'
 import type { SyntaxNode } from '@lezer/common'
@@ -150,6 +150,11 @@ class EmptyTableCell extends WidgetType {
   }
 }
 
+/** `\\`、`\|` 在格子里只显示后一个字：返回这些反斜杠的位置 */
+function hiddenEscapes(state: EditorState, cell: TableCell): number[] {
+  return [...state.sliceDoc(cell.start, cell.end).matchAll(/\\[\\|]/g)].map(match => cell.start + match.index!)
+}
+
 type DecorationRange = { from: number; to: number; deco: Decoration }
 
 function eachTable(state: EditorState, visit: (node: SyntaxNode) => void): void {
@@ -202,11 +207,7 @@ function decorateRow(state: EditorState, row: TableRow, rowIndex: number, align:
     if (right < cell.to) ranges.push({ from: right, to: cell.to, deco: Decoration.replace({ widget: new TableBoundary(column, true) }) })
     if (cell.start > left) ranges.push({ from: left, to: cell.start, deco: Decoration.mark({ class: 'cm-md-table-padding' }) })
     if (cell.end < right) ranges.push({ from: cell.end, to: right, deco: Decoration.mark({ class: 'cm-md-table-padding' }) })
-    const content = state.sliceDoc(cell.start, cell.end)
-    for (const match of content.matchAll(/\\[\\|]/g)) {
-      const from = cell.start + match.index!
-      ranges.push({ from, to: from + 1, deco: Decoration.replace({}) })
-    }
+    for (const from of hiddenEscapes(state, cell)) ranges.push({ from, to: from + 1, deco: Decoration.replace({}) })
   })
   for (let column = row.cells.length; column < columns; column++) {
     ranges.push({ from: row.to, to: row.to, deco: Decoration.widget({ widget: new EmptyTableCell(column, align[column], editable), side: column + 1 }) })
@@ -557,9 +558,38 @@ function cellText(text: string): string {
   return text.replace(/\r\n?|\n/g, '<br>').replace(/(\\*)\|/g, (match, slashes: string) => slashes.length % 2 ? match : `${slashes}\\|`)
 }
 
+/** 结尾的反斜杠是否落单：落单的会和后面一个字组成转义 */
+const loneSlash = (text: string) => /(?:^|[^\\])(?:\\\\)*\\$/.test(text)
+/** 这些字被落单的反斜杠转义后，格子的显示或分格会变 */
+const ESCAPABLE = /^(?:[\\|]|<br)/i
+
+/**
+ * 把格子里的一次改动换成按看到的字改原文：`\\`、`\|` 只显示一个字，删除和选择时整对处理；
+ * 新内容与两侧落单的反斜杠相接时补一个，免得它转义掉旁边的竖线、反斜杠或 `<br>`。
+ */
+function cellChange(state: EditorState, cell: TableCell, from: number, to: number, text: string) {
+  const empty = from === to
+  for (const escape of hiddenEscapes(state, cell)) {
+    if (from === escape + 1) from = escape
+    if (to === escape + 1) to = empty ? from : escape + 2
+  }
+  const before = state.sliceDoc(Math.min(from, cell.start), from)
+  let insert = cellText(text)
+  if (loneSlash(before) && ESCAPABLE.test(insert)) insert = `\\${insert}`
+  if (loneSlash(before + insert) && ESCAPABLE.test(state.sliceDoc(to, to + 3))) insert += '\\'
+  return { from, to, insert }
+}
+
 /** 选区是否整个落在格里（不含两侧的竖线）。还没写进原文的格子只认空光标。 */
 function withinCell(cell: TableCell | undefined, from: number, to: number): boolean {
   return cell ? from >= cell.left && to <= cell.right : from === to
+}
+
+/** [from, to] 整个落在哪一格的竖线之间 */
+function cellAround(state: EditorState, from: number, to: number): TableCell | undefined {
+  const table = tableAt(state, from)
+  const row = table?.rows.find(row => from >= row.from && to <= row.to)
+  return row?.cells.slice(0, table!.align.length).find(cell => withinCell(cell, from, to))
 }
 
 function insertCellText(view: EditorView, from: number, to: number, text: string): boolean {
@@ -575,9 +605,9 @@ function insertCellText(view: EditorView, from: number, to: number, text: string
       view.dispatch({ changes: { from: cell.left, to: cell.right, insert }, selection: { anchor: cell.left + 1 + value.length }, annotations: tableEdit.of(true), userEvent: 'input.type' })
       return true
     }
-    const escaped = cellText(view.state.sliceDoc(cell.start, from) + text).slice(from - cell.start)
-    if (escaped === text && cell.start !== cell.end) return false
-    view.dispatch({ changes: { from, to, insert: escaped }, selection: { anchor: from + escaped.length }, annotations: tableEdit.of(true), userEvent: 'input.type' })
+    const change = cellChange(view.state, cell, from, to, text)
+    if (change.from === from && change.to === to && change.insert === text && cell.start !== cell.end) return false
+    view.dispatch({ changes: change, selection: { anchor: change.from + change.insert.length }, annotations: tableEdit.of(true), userEvent: 'input.type' })
   } else {
     const target = table.rows[row]
     const trailing = target.trailing
@@ -695,7 +725,11 @@ export const tableEditing = [
     if (!current) return tr
     const { table, row, cell } = current
     const pos = tr.newSelection.main.head
-    const anchor = cell ? Math.max(cell.start, Math.min(cell.end, pos)) : table.rows[row].to
+    let anchor = cell ? Math.max(cell.start, Math.min(cell.end, pos)) : table.rows[row].to
+    // 隐藏的转义符和它后面的字之间看不出位置：方向键越过这一对，点击落在它前面
+    if (cell && hiddenEscapes(tr.state, cell).includes(anchor - 1)) {
+      anchor += !tr.isUserEvent('select.pointer') && anchor > tr.startState.selection.main.head ? 1 : -1
+    }
     return anchor === pos ? tr : [tr, { selection: { anchor } }]
   }),
   EditorState.changeFilter.of(tr => {
@@ -729,6 +763,19 @@ export const tableEditing = [
       }
     })
     return touchesStructure ? protectedRanges : true
+  }),
+  // 删除、剪切、拖放不经过 insertCellText，同样按看到的字改原文。组合输入期间不动，免得打断输入法
+  EditorState.transactionFilter.of(tr => {
+    if (!tr.docChanged || tr.annotation(tableEdit) || tr.isUserEvent('input.type.compose') || !(tr.isUserEvent('input') || tr.isUserEvent('delete'))) return tr
+    const edits: { from: number; to: number; text: string }[] = []
+    tr.changes.iterChanges((from, to, _fromB, _toB, inserted) => { edits.push({ from, to, text: inserted.toString() }) })
+    if (edits.length !== 1) return tr
+    const { from, to, text } = edits[0]
+    const cell = cellAround(tr.startState, from, to)
+    if (!cell) return tr
+    const change = cellChange(tr.startState, cell, from, to, text)
+    if (change.from === from && change.to === to && change.insert === text) return tr
+    return { changes: change, selection: { anchor: change.from + change.insert.length }, userEvent: tr.annotation(Transaction.userEvent), scrollIntoView: tr.scrollIntoView }
   }),
   Prec.high(keymap.of([
     { key: 'Tab', run: view => navigate(view, 1) },
@@ -825,7 +872,7 @@ export const tableEditing = [
       const { from, to } = view.state.selection.main
       if (!withinCell(current.cell, from, to)) return false
       const { table, row, column } = current
-      const values = text.replace(/\r\n?/g, '\n').replace(/\n$/, '').split('\n').map(line => line.split('\t').map(cellText))
+      const values = text.replace(/\r\n?/g, '\n').replace(/\n$/, '').split('\n').map(line => line.split('\t'))
       const columns = Math.max(table.align.length, column + Math.max(...values.map(row => row.length)))
       const changes: ChangeSpec[] = []
       const rows = [...table.rows, table.delimiter]
@@ -833,12 +880,12 @@ export const tableEditing = [
         const index = table.rows.indexOf(target)
         for (let c = 0; c < Math.min(target.cells.length, table.align.length); c++) {
           const value = values[index - row]?.[c - column]
-          if (index >= row && c >= column && value !== undefined) changes.push({ from: target.cells[c].start, to: target.cells[c].end, insert: value })
+          if (index >= row && c >= column && value !== undefined) changes.push(cellChange(view.state, target.cells[c], target.cells[c].start, target.cells[c].end, value))
         }
         if (target.cells.length < columns) {
           const extra = Array.from({ length: columns - target.cells.length }, (_, i) => {
             const c = i + target.cells.length
-            return index < 0 ? '---' : values[index - row]?.[c - column] ?? ''
+            return index < 0 ? '---' : cellText(values[index - row]?.[c - column] ?? '')
           })
           const trailing = target.trailing
           changes.push({ from: target.to, insert: `${trailing ? '' : ' |'} ${extra.join(' | ')} |` })
@@ -847,7 +894,7 @@ export const tableEditing = [
       const prefix = view.state.sliceDoc(view.state.doc.lineAt(table.delimiter.from).from, table.delimiter.from)
       let added = ''
       for (let r = table.rows.length; r < row + values.length; r++) {
-        added += `\n${prefix}| ${Array.from({ length: columns }, (_, c) => values[r - row]?.[c - column] ?? '').join(' | ')} |`
+        added += `\n${prefix}| ${Array.from({ length: columns }, (_, c) => cellText(values[r - row]?.[c - column] ?? '')).join(' | ')} |`
       }
       if (added) changes.push({ from: table.to, insert: added })
       editTable(view, table, changes, row + values.length - 1, column + values.at(-1)!.length - 1)

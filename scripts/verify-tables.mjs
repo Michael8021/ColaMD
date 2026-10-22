@@ -116,6 +116,7 @@ try {
   const type = text => send('Input.insertText', { text })
   const paste = text => evaluate(`(() => {const data=new DataTransfer();data.setData('text/plain',${JSON.stringify(text)});v.contentDOM.dispatchEvent(new ClipboardEvent('paste',{clipboardData:data,bubbles:true,cancelable:true}))})()`)
   const exportHTML = () => evaluate('window.__colamdExportDocumentHTML()')
+  const head = () => evaluate('v.state.selection.main.head')
 
   check('打开表格不修改原文', await doc() === fixture, JSON.stringify({doc:await doc(), errors}))
   check('表格按原有对齐方式显示', await evaluate(`Array.from(document.querySelectorAll('.cm-md-table-header .cm-md-table-cell')).map(c=>getComputedStyle(c).textAlign).join(',')`) === 'left,center,right')
@@ -371,6 +372,111 @@ try {
   await paste('第一行\n第二行')
   check('多行粘贴保留在单元格内', (await doc()).includes('第一行<br>第二行'), await doc())
   await key('z', MOD)
+  // 反斜杠和字面竖线：按看到的字编辑，不改变分格
+  const S = '\\'
+  const rowCells = row => evaluate(`Array.from(document.querySelectorAll('.cm-md-table-row')[${row}].querySelectorAll('.cm-md-table-cell')).map(c => c.textContent.trim())`)
+  const exportCells = async () => [...(await exportHTML()).matchAll(/<td[^>]*>(.*?)<\/td>/g)].map(match => match[1])
+  const cursor = (pos, assoc = 0, userEvent) => evaluate(`(() => { const S = v.state.selection.constructor; v.dispatch({selection:S.create([S.cursor(${pos},${assoc})]),userEvent:${JSON.stringify(userEvent)}}); v.focus() })()`)
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b)
+  const compactSlash = '|A|B|\n|---|---|\n|x|y|\n'
+  const compactTyped = `|A|B|\n|---|---|\n|x${S}${S}|y|\n`
+  await setDoc(compactSlash)
+  await cursor(compactSlash.indexOf('x') + 1, -1)
+  await type(S)
+  check('紧凑格尾输入反斜杠不转义右侧竖线', await doc() === compactTyped && same(await rowCells(1), [`x${S}`, 'y']), JSON.stringify([await doc(), await rowCells(1)]))
+  check('格尾反斜杠导出仍是两格', same(await exportCells(), [`x${S}`, 'y']), await exportHTML())
+  await key('z', MOD)
+  check('格尾反斜杠一步撤销', await doc() === compactSlash, await doc())
+  await key('z', MOD | 8)
+  check('格尾反斜杠可重做', await doc() === compactTyped, await doc())
+  await setDoc(compactSlash)
+  const compactEnd = await evaluate(`(() => { const range = document.createRange(); range.selectNodeContents(document.querySelectorAll('.cm-md-table-row')[1].querySelector('.cm-md-table-cell')); const r = range.getBoundingClientRect(); return {x: r.right + 2, y: r.top + r.height / 2} })()`)
+  for (const kind of ['mousePressed', 'mouseReleased']) await send('Input.dispatchMouseEvent', { type: kind, ...compactEnd, button: 'left', clickCount: 1 })
+  await sleep(50)
+  await type(S)
+  check('点击紧凑格尾后输入反斜杠保持两格', await doc() === compactTyped, await doc())
+
+  const escapedPipe = `|A|B|\n|---|---|\n|a${S}|b|c|\n`
+  for (const [name, offset] of [['转义竖线前', 0], ['点在转义符和竖线之间后', 1]]) {
+    await setDoc(escapedPipe)
+    await cursor(escapedPipe.indexOf(`a${S}|`) + 1 + offset, 0, 'select.pointer')
+    if (offset) check('点击不停在隐藏的转义符后', await head() === escapedPipe.indexOf(`${S}|`), await head())
+    await type(S)
+    check(`${name}输入反斜杠保留后面的格子`, await doc() === `|A|B|\n|---|---|\n|a${S}${S}${S}|b|c|\n` && same(await rowCells(1), [`a${S}|b`, 'c']), JSON.stringify([await doc(), await rowCells(1)]))
+  }
+  check('转义竖线前的反斜杠导出保留字面竖线和后面的格子', same(await exportCells(), [`a${S}|b`, 'c']), await exportHTML())
+
+  const literal = `| A | B |\n|---|---|\n| a${S}|b | c |\n`
+  const removed = '| A | B |\n|---|---|\n| ab | c |\n'
+  await setDoc(literal)
+  await cursor(literal.indexOf('|b') + 1)
+  await key('Backspace')
+  check('Backspace 删除字面竖线时连同转义符', await doc() === removed && same(await rowCells(1), ['ab', 'c']), await doc())
+  await key('z', MOD)
+  check('删除字面竖线一步撤销', await doc() === literal, await doc())
+  await key('z', MOD | 8)
+  check('删除字面竖线可重做', await doc() === removed, await doc())
+  await setDoc(literal)
+  await cursor(literal.indexOf(`${S}|`))
+  await key('Delete')
+  check('Delete 删除字面竖线时连同转义符', await doc() === removed, await doc())
+  await setDoc(literal)
+  await select(`${S}|`, 0, 1)
+  await key('Delete')
+  check('只选中隐藏的转义符删除时整对删除', await doc() === removed, await doc())
+  await setDoc(literal)
+  await select('|b', 0, 1)
+  await key('Backspace')
+  check('选中字面竖线删除时连同转义符', await doc() === removed, await doc())
+  await setDoc(literal)
+  await select('|b', 0, 1)
+  const cut = await evaluate(`(() => { const data = new DataTransfer(); v.contentDOM.dispatchEvent(new ClipboardEvent('cut', {clipboardData: data, bubbles: true, cancelable: true})); return data.getData('text/plain') })()`)
+  check('剪切字面竖线时连同转义符', await doc() === removed && cut.includes('|'), JSON.stringify([await doc(), cut]))
+  await key('z', MOD)
+  check('剪切字面竖线一步撤销', await doc() === literal, await doc())
+
+  await setDoc(literal)
+  await cursor(literal.indexOf(`a${S}|`) + 1)
+  await key('ArrowRight')
+  check('右方向键一步跨过字面竖线', await head() === literal.indexOf('|b') + 1, await head())
+  await key('ArrowLeft')
+  check('左方向键一步退回字面竖线前', await head() === literal.indexOf(`${S}|`), await head())
+
+  const slashes = `| A | B |\n|---|---|\n| a${S.repeat(4)}b | c |\n`
+  await setDoc(slashes)
+  await cursor(slashes.indexOf('a') + 3)
+  await key('Backspace')
+  check('连续反斜杠一次删掉一个', await doc() === `| A | B |\n|---|---|\n| a${S}${S}b | c |\n` && same(await rowCells(1), [`a${S}b`, 'c']), await doc())
+
+  const lone = `|A|B|\n|---|---|\n|x${S}a|y|\n`
+  await setDoc(lone)
+  await cursor(lone.indexOf('a|') + 1, -1)
+  await key('Backspace')
+  check('删掉落单反斜杠后的字不转义右侧竖线', await doc() === compactTyped && same(await rowCells(1), [`x${S}`, 'y']), await doc())
+
+  const loneBefore = `| A | B |\n|---|---|\n| ${S}a | b |\n`
+  await setDoc(loneBefore)
+  await cursor(loneBefore.indexOf(`${S}a`) + 1)
+  await type('|')
+  check('落单反斜杠后输入竖线两个字都保留', await doc() === `| A | B |\n|---|---|\n| ${S}${S}${S}|a | b |\n` && same(await rowCells(1), [`${S}|a`, 'b']), await doc())
+
+  const loneEnd = `| A | B |\n|---|---|\n| x${S} | y |\n`
+  await setDoc(loneEnd)
+  await cursor(loneEnd.indexOf(`x${S}`) + 2)
+  await key('Enter', 8)
+  check('落单反斜杠后换行仍是格内换行', await doc() === `| A | B |\n|---|---|\n| x${S}${S}<br> | y |\n` && (await exportCells())[0] === `x${S}<br>`, JSON.stringify([await doc(), await exportHTML()]))
+
+  const breakCell = '| A | B |\n|---|---|\n| a<br>b | c |\n'
+  await setDoc(breakCell)
+  await cursor(breakCell.indexOf('<br>'))
+  await type(S)
+  check('格内换行前输入反斜杠不转义换行', await doc() === `| A | B |\n|---|---|\n| a${S}${S}<br>b | c |\n`, await doc())
+
+  await setDoc(compactSlash)
+  await select('x')
+  await paste(`p${S}\tq${S}`)
+  check('多格粘贴以反斜杠结尾不转义竖线', await doc() === `|A|B|\n|---|---|\n|p${S}${S}|q${S}${S}|\n` && same(await rowCells(1), [`p${S}`, `q${S}`]), await doc())
+  await setDoc(fixture)
   await select('苹果')
   await send('Input.imeSetComposition', { text: 'zhong', selectionStart: 5, selectionEnd: 5 }); await sleep(60)
   await send('Input.imeSetComposition', { text: '中文', selectionStart: 2, selectionEnd: 2 }); await sleep(60)
@@ -482,7 +588,6 @@ try {
   await type('正文')
   check('无结尾换行的表格后也能继续写作', await doc() === noNewline + '\n\n正文', await doc())
   // 文档以表格开头或结尾时，外面没有能落脚的行：方向键离开要补出空段落，否则光标被夹回格子里
-  const head = () => evaluate('v.state.selection.main.head')
   await setDoc(noNewline)
   await sleep(600)
   await select('value', 5)
