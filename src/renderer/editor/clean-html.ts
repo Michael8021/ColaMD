@@ -214,17 +214,16 @@ function renderCode(lines: HTMLElement[]): string {
   return `<pre><code>${escapeText(code)}</code></pre>`
 }
 
-function renderGroup(kind: LineKind, lines: HTMLElement[]): string {
+function renderGroup(kind: LineKind, lines: HTMLElement[], ownerDepth = -1): string {
   if (kind === 'code') return renderCode(lines)
   if (kind === 'li') return renderList(lines)
   if (kind === 'quote') {
-    // 引用里还有块（标题、列表、代码）：剥掉引用的类，再按块翻译一遍
-    const inner = lines.map((line) => {
+    const inner = lines.map(line => {
       const clone = line.cloneNode(true) as HTMLElement
       clone.classList.remove('cm-md-blockquote')
       return clone
     })
-    return `<blockquote>${blocksHTML(inner)}</blockquote>`
+    return `<blockquote>${blocksHTML(inner, ownerDepth)}</blockquote>`
   }
   if (kind === 'table') {
     const table = lines[0].querySelector<HTMLElement>('.cm-md-table-widget')
@@ -252,7 +251,7 @@ function mergeable(kind: LineKind): boolean {
 }
 
 /** 把一串「行」按块翻译成 HTML。行与行之间是编辑器自己的排版，这里重建文档结构。 */
-function blocksHTML(nodes: Node[]): string {
+function blocksHTML(nodes: Node[], ownerDepth = -1): string {
   let html = ''
   let index = 0
   while (index < nodes.length) {
@@ -283,7 +282,7 @@ function blocksHTML(nodes: Node[]): string {
     } else {
       index += 1
     }
-    html += renderGroup(kind, group)
+    html += renderGroup(kind, group, ownerDepth)
   }
   return html
 }

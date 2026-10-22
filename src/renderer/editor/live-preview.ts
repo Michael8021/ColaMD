@@ -57,6 +57,16 @@ function pushBlockLines(
     ranges.push({ from: lineFrom, to: lineFrom, deco: BLOCK(className) })
   }
 }
+/** 列表首行的复制信息独立添加，与整项的逐行样式合并。 */
+function pushListItemStart(state: EditorState, node: SyntaxNode, ranges: DecorationRange[]): void {
+  const mark = node.getChild('ListMark')
+  const number = mark && node.parent?.name === 'OrderedList' ? Number.parseInt(state.doc.sliceString(mark.from, mark.to), 10) : NaN
+  const from = state.doc.lineAt(node.from).from
+  ranges.push({ from, to: from, deco: Decoration.line({
+    class: `cm-md-li-start${Number.isFinite(number) ? ' cm-md-li-ordered' : ''}`,
+    attributes: Number.isFinite(number) ? { 'data-list-number': String(number) } : undefined,
+  }) })
+}
 /**
  * 列表项：只给它**自己那一行**加类，不给它子列表里的行加。
  *
@@ -68,15 +78,6 @@ function pushBlockLines(
 function pushListItemLines(state: EditorState, node: SyntaxNode, ranges: DecorationRange[]): void {
   const className = `cm-md-li cm-md-li-${Math.min(listDepth(node), 6)}`
   const tree = syntaxTree(state)
-  // 有序与否、每一项从哪一行开始，也记在行上：复制只选到一项的半行时，序号不在选区里，
-  // 富文本那边仍要认得出这是第几项的有序列表，也要分清续行和新的一项。
-  const mark = node.getChild('ListMark')
-  const number = mark && node.parent?.name === 'OrderedList' ? Number.parseInt(state.doc.sliceString(mark.from, mark.to), 10) : NaN
-  const first = state.doc.lineAt(node.from).number
-  const startLine = Decoration.line({
-    class: `${className} cm-md-li-start${Number.isFinite(number) ? ' cm-md-li-ordered' : ''}`,
-    attributes: Number.isFinite(number) ? { 'data-list-number': String(number) } : undefined,
-  })
 
   // 子列表之前的行一定是这一项自己的（包括项里的空行），不用问语法树。
   let ownEnd = node.to
@@ -87,6 +88,7 @@ function pushListItemLines(state: EditorState, node: SyntaxNode, ranges: Decorat
     }
   }
 
+  const first = state.doc.lineAt(node.from).number
   const last = state.doc.lineAt(node.to).number
   for (let n = first; n <= last; n++) {
     const line = state.doc.line(n)
@@ -99,7 +101,7 @@ function pushListItemLines(state: EditorState, node: SyntaxNode, ranges: Decorat
       while (owner && owner.name !== 'ListItem') owner = owner.parent
       if (!owner || owner.from !== node.from) continue
     }
-    ranges.push({ from: line.from, to: line.from, deco: n === first ? startLine : BLOCK(className) })
+    ranges.push({ from: line.from, to: line.from, deco: BLOCK(className) })
   }
 }
 
@@ -1091,6 +1093,7 @@ function collectBlocks(state: EditorState, ranges: DecorationRange[], front: Ran
       // CM6 没有 ul/ol/li 元素，缩进只能自己算；层级来自语法的嵌套深度。
       case 'ListItem': {
         pushListItemLines(state, node.node, ranges)
+        pushListItemStart(state, node.node, ranges)
         break
       }
       case 'FencedCode': {
