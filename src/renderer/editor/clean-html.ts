@@ -225,6 +225,10 @@ function renderCode(lines: HTMLElement[]): string {
   return `<pre><code>${escapeText(code)}</code></pre>`
 }
 
+function tableCellsHTML(cells: HTMLElement[], tag: 'th' | 'td'): string {
+  return cells.map(cell => `<${tag} style="text-align:${cell.style.textAlign || 'left'}">${childrenHTML(cell).replace(/^[ \t]+|[ \t]+$/g, '')}</${tag}>`).join('')
+}
+
 function renderGroup(kind: LineKind, lines: HTMLElement[], ownerDepth = -1): string {
   if (kind === 'code') return renderCode(lines)
   if (kind === 'li') return renderList(lines)
@@ -243,9 +247,7 @@ function renderGroup(kind: LineKind, lines: HTMLElement[], ownerDepth = -1): str
     for (const line of lines) {
       if (line.classList.contains('cm-md-table-delimiter')) continue
       const header = line.classList.contains('cm-md-table-header')
-      const tag = header ? 'th' : 'td'
-      const cells = Array.from(line.querySelectorAll<HTMLElement>('.cm-md-table-cell'))
-        .map(cell => `<${tag} style="text-align:${cell.style.textAlign || 'left'}">${childrenHTML(cell).replace(/^[ \t]+|[ \t]+$/g, '')}</${tag}>`).join('')
+      const cells = tableCellsHTML(Array.from(line.querySelectorAll<HTMLElement>('.cm-md-table-cell')), header ? 'th' : 'td')
       if (header) {
         flush()
         head = `<thead><tr>${cells}</tr></thead>`
@@ -338,12 +340,20 @@ function blocksHTML(nodes: Node[], ownerDepth = -1): string {
     if (!isLineElement(node)) {
       // 选区从一个行的中间开始或结束：连续的行内片段属于同一行，要合成一个段落。
       // 不合并的话，`含 **加粗**、` 会变成「含」「加粗」「、」三个段落。
-      const inline: string[] = []
+      const inline: Node[] = []
       while (index < nodes.length && !isLineElement(nodes[index])) {
-        inline.push(inlineHTML(nodes[index]))
+        inline.push(nodes[index])
         index += 1
       }
-      const merged = inline.join('')
+      // 同一行里跨了几个单元格：交出这几格组成的一行表格，否则格子之间的分隔会丢，两格并成一段
+      const cells = inline.filter((part): part is HTMLElement => part instanceof HTMLElement && part.classList.contains('cm-md-table-cell'))
+      if (cells.length > 1) {
+        html += cells.some(cell => cell.getAttribute('role') === 'columnheader')
+          ? `<table><thead><tr>${tableCellsHTML(cells, 'th')}</tr></thead></table>`
+          : `<table><tbody><tr>${tableCellsHTML(cells, 'td')}</tr></tbody></table>`
+        continue
+      }
+      const merged = inline.map(node => inlineHTML(node)).join('')
       if (merged.trim() !== '') html += `<p>${merged}</p>`
       continue
     }

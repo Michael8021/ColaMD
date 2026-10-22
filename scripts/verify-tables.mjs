@@ -63,7 +63,7 @@ try {
   assert(mainTarget, '主进程调试连接未启动')
   mainWS = new WebSocket(mainTarget.webSocketDebuggerUrl)
   await new Promise((resolve, reject) => { mainWS.addEventListener('open', resolve); mainWS.addEventListener('error', reject) })
-  const setTheme = async (name, css) => {
+  const mainEval = async expression => {
     const requestId = ++id
     const reply = new Promise(resolve => {
       const receive = event => {
@@ -74,11 +74,17 @@ try {
       }
       mainWS.addEventListener('message', receive)
     })
-    // 走菜单/自定义主题实际使用的 IPC，验证 applyTheme 的完整通知路径。
-    const expression = `(() => { const web = process.getBuiltinModule('module').createRequire(process.cwd() + '/package.json')('electron').BrowserWindow.getAllWindows()[0].webContents; web.send('set-theme', ${JSON.stringify(name)}); ${css === undefined ? '' : `web.send('set-custom-css', ${JSON.stringify(css)});`} })()`
-    mainWS.send(JSON.stringify({ id: requestId, method: 'Runtime.evaluate', params: { expression } }))
+    mainWS.send(JSON.stringify({ id: requestId, method: 'Runtime.evaluate', params: { expression, returnByValue: true, awaitPromise: true } }))
     const response = await reply
     assert(!response.error && !response.result.exceptionDetails, JSON.stringify(response))
+    return response.result.result?.value
+  }
+  const ELECTRON = "process.getBuiltinModule('module').createRequire(process.cwd() + '/package.json')('electron')"
+  const sendToWindow = (channel, payload) => mainEval(`${ELECTRON}.BrowserWindow.getAllWindows()[0].webContents.send(${JSON.stringify(channel)}, ${JSON.stringify(payload)})`)
+  const setTheme = async (name, css) => {
+    // 走菜单/自定义主题实际使用的 IPC，验证 applyTheme 的完整通知路径。
+    await sendToWindow('set-theme', name)
+    if (css !== undefined) await sendToWindow('set-custom-css', css)
     await sleep(150)
   }
   await send('Runtime.enable')
@@ -476,6 +482,39 @@ try {
   await select('x')
   await paste(`p${S}\tq${S}`)
   check('多格粘贴以反斜杠结尾不转义竖线', await doc() === `|A|B|\n|---|---|\n|p${S}${S}|q${S}${S}|\n` && same(await rowCells(1), [`p${S}`, `q${S}`]), await doc())
+  await setDoc(fixture)
+
+  // 同一行跨格复制：富文本口味是选中的这几格组成的一行表格，没选到的字不补进去
+  const copyRow = '| 名称 | 数量 | 备注 |\n|---|---:|---|\n| 苹果 | 12 |  |\n'
+  const copyEvent = () => evaluate(`(() => { const data = new DataTransfer(); v.contentDOM.dispatchEvent(new ClipboardEvent('copy', {clipboardData: data, bubbles: true, cancelable: true})); return {plain: data.getData('text/plain'), html: data.getData('text/html')} })()`)
+  await setDoc(copyRow)
+  await select('果 | 12', 0, '果 | 12'.length)
+  let copied = await copyEvent()
+  check('跨格复制的纯文本仍是原文', copied.plain === '果 | 12', JSON.stringify(copied))
+  check('跨格复制的富文本是一行表格且不补未选的字', copied.html === '<table><tbody><tr><td style="text-align:left">果</td><td style="text-align:right">12</td></tr></tbody></table>', copied.html)
+  await select('名称 | 数', 0, '名称 | 数'.length)
+  copied = await copyEvent()
+  check('表头跨格复制保留表头', copied.html === '<table><thead><tr><th style="text-align:left">名称</th><th style="text-align:right">数</th></tr></thead></table>', copied.html)
+  await select('果', 0, copyRow.lastIndexOf('|') - copyRow.indexOf('果'))
+  copied = await copyEvent()
+  check('跨到空格子的复制保留空格子', copied.html === '<table><tbody><tr><td style="text-align:left">果</td><td style="text-align:right">12</td><td style="text-align:left"></td></tr></tbody></table>', copied.html)
+  await select('苹果', 1, 1)
+  copied = await copyEvent()
+  check('单格内复制仍是文字', /^<p>.*果.*<\/p>$/.test(copied.html) && !/<t[dhr]|<table/.test(copied.html) && !copied.html.includes('苹'), copied.html)
+  await mainEval(`(async () => { const { clipboard, ClipboardItem } = ${ELECTRON}; globalThis.__tablesClipboard = await Promise.all((await clipboard.read()).map(async item => new ClipboardItem(Object.fromEntries(await Promise.all(item.types.map(async type => [type, await item.getType(type)])))))) })()`)
+  try {
+    await select('果 | 12', 0, '果 | 12'.length)
+    await evaluate(`document.execCommand('copy')`)
+    const system = await mainEval(`(async () => { const items = await ${ELECTRON}.clipboard.read(); const get = async type => { const item = items.find(item => item.types.includes(type)); return item ? (await item.getType(type)).text() : '' }; return { text: await get('text/plain'), html: await get('text/html') } })()`)
+    check('系统剪贴板拿到原文和一行表格', system.text === '果 | 12' && system.html.includes('<td style="text-align:left">果</td><td style="text-align:right">12</td>'), JSON.stringify(system))
+    await setDoc('正文\n')
+    await select('正文', 2)
+    await mainEval(`${ELECTRON}.BrowserWindow.getAllWindows()[0].webContents.paste()`)
+    await sleep(200)
+    check('系统粘贴回编辑器得到原文', await doc() === '正文果 | 12\n', await doc())
+  } finally {
+    await mainEval(`(async () => { const { clipboard } = ${ELECTRON}; clipboard.clear(); if (globalThis.__tablesClipboard.length) await clipboard.write(globalThis.__tablesClipboard) })()`)
+  }
   await setDoc(fixture)
   await select('苹果')
   await send('Input.imeSetComposition', { text: 'zhong', selectionStart: 5, selectionEnd: 5 }); await sleep(60)
