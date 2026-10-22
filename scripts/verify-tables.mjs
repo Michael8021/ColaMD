@@ -294,7 +294,7 @@ try {
     const first = word => { const walker = document.createTreeWalker(v.contentDOM, NodeFilter.SHOW_TEXT); let node; while(node = walker.nextNode()) { const at = node.textContent.indexOf(word); if(at < 0) continue; const range = document.createRange(); range.setStart(node, at); range.setEnd(node, at + 1); return { rect:range.getBoundingClientRect(), cell:node.parentElement.closest('.cm-md-table-cell') } } }
     const lines = ['第一行', '第二行', '第三行'].map(first)
     const english = first('document_export')
-    return Math.max(...lines.map(line => line.rect.left)) - Math.min(...lines.map(line => line.rect.left)) < 1 && english.rect.top - english.cell.getBoundingClientRect().top < parseFloat(getComputedStyle(english.cell).lineHeight)
+    return Math.max(...lines.map(line => line.rect.left)) - Math.min(...lines.map(line => line.rect.left)) < 1 && english.rect.top - english.cell.getBoundingClientRect().top - parseFloat(getComputedStyle(english.cell).paddingTop) < parseFloat(getComputedStyle(english.cell).lineHeight) / 2
   })()`))
   const compact = '|名称|值|\n|---|---|\n|宽度|1280|\n'
   await setDoc(compact)
@@ -347,6 +347,23 @@ try {
   }
   await setDoc('| 内容 | 备注 |\n|---|---|\n| ' + 'long_identifier_'.repeat(20) + ' | 自动折行 |\n')
   check('长英文仍能换行，表格不撑出文档', await evaluate(`(() => { const cell = document.querySelectorAll('.cm-md-table-row')[1].querySelector('.cm-md-table-cell'); return cell.offsetHeight > parseFloat(getComputedStyle(cell).lineHeight) * 2 && document.querySelector('.cm-md-table-widget:has(.cm-md-table-row)').offsetWidth <= v.contentDOM.clientWidth })()`))
+  // 长数字：放不下时拆行；打印时纸比窗口窄、脚本来不及重排，列宽按占比缩小，数字也不能出格
+  const digits = '1234567890'.repeat(4)
+  const numbersFit = () => evaluate(`(() => { const table = document.querySelector('.cm-md-table-widget:has(.cm-md-table-row)'); const numbers = [...document.querySelectorAll('.cm-md-table-number')]; const gap = cell => { const text = [...cell.querySelectorAll('*'), cell].flatMap(node => [...node.childNodes]).find(node => node.nodeType === 3 && node.textContent.trim()); const range = document.createRange(); range.setStart(text, 0); range.setEnd(text, 1); return range.getBoundingClientRect().top - cell.getBoundingClientRect().top - parseFloat(getComputedStyle(cell).paddingTop) }; return { table: table.getBoundingClientRect().width, content: v.contentDOM.getBoundingClientRect().width - parseFloat(getComputedStyle(v.contentDOM).paddingLeft) - parseFloat(getComputedStyle(v.contentDOM).paddingRight), overflow: numbers.filter(cell => cell.scrollWidth > cell.clientWidth + 1).length, blankFirstLine: numbers.filter(cell => gap(cell) > parseFloat(getComputedStyle(cell).lineHeight) / 2).length, text: numbers.map(cell => cell.textContent.trim()) } })()`)
+  await setDoc(`| First | Second | Last |\n|---|---|---|\n| ${digits} | ${digits} | ${digits} |\n`)
+  await sleep(300)
+  let numbers = await numbersFit()
+  check('放不下的长数字拆行，表格不撑出正文', numbers.table <= numbers.content + 1 && numbers.overflow === 0 && numbers.text.every(text => text === digits), JSON.stringify(numbers))
+  check('拆行的长数字从第一行开始，不留空行', numbers.blankFirstLine === 0, JSON.stringify(numbers))
+  const paperDigits = '1234567890'.repeat(2)
+  await setDoc(`| First | Second | Last |\n|---|---|---|\n| ${paperDigits} | ${paperDigits} | ${paperDigits} |\n`)
+  await sleep(300)
+  check('放得下的数字在屏幕上不拆行', await evaluate(`[...document.querySelectorAll('.cm-md-table-number')].every(cell => cell.getClientRects().length && cell.getBoundingClientRect().height < parseFloat(getComputedStyle(cell).lineHeight) * 1.5 + 20)`), JSON.stringify(await numbersFit()))
+  await send('Emulation.setEmulatedMedia', { media: 'print' })
+  numbers = await evaluate(`(() => { const content = v.contentDOM; const saved = content.style.cssText; content.style.cssText += ';width:520px;max-width:520px;min-width:0'; const table = document.querySelector('.cm-md-table-widget:has(.cm-md-table-row)').getBoundingClientRect().width; const inner = content.getBoundingClientRect().width - parseFloat(getComputedStyle(content).paddingLeft) - parseFloat(getComputedStyle(content).paddingRight); const overflow = [...document.querySelectorAll('.cm-md-table-number')].filter(cell => cell.scrollWidth > cell.clientWidth + 1).length; content.style.cssText = saved; return { table, inner, overflow } })()`)
+  await send('Emulation.setEmulatedMedia', { media: '' })
+  check('打印时纸比窗口窄，表格按占比缩到纸宽且数字不出格', numbers.table <= numbers.inner + 1 && numbers.overflow === 0, JSON.stringify(numbers))
+  await setDoc(fixture)
   await setDoc('| 公式 | 说明 |\n|---|---|\n| $E=mc^2$ | 行内公式 |\n')
   check('表格内现有行内公式正常渲染并导出', await evaluate(`!!document.querySelector('.cm-md-table-cell .katex')`) && (await exportHTML()).includes('katex'))
   const multiple = '| A | B |\n|---|---:|\n| first | 123 |\n|  | empty |\n\n> | C | D |\n> |---|---|\n> | quoted | tail |\n'

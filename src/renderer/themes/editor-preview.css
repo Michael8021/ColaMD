@@ -374,7 +374,9 @@
 .cm-content .cm-md-table-row > .cm-widgetBuffer { display: none; }
 .cm-content .cm-md-table-row > br { display: none; }
 .cm-content .cm-md-table-row > span:not(.cm-md-table-cell) { display: none; }
-.cm-content .cm-md-table-padding { font-size: 0; }
+/* 可编辑区里格子的空白会被保留，开头这个空格后面是换行机会：放不下的长词、长数字会
+ * 整段挪到第二行，第一行只剩空格。不让它在这里断行 */
+.cm-content .cm-md-table-padding { font-size: 0; white-space: nowrap; }
 .cm-content .cm-md-table-number { white-space: nowrap; }
 
 .cm-content .cm-md-table-input {
@@ -604,6 +606,9 @@ body.exporting .cm-content .cm-md-frontmatter {
   .cm-content .cm-md-frontmatter {
     display: none !important;
   }
+
+  /* 纸比窗口窄，打印时脚本不会重排：列宽按占比缩小，放不下的数字拆行，不裁到纸外 */
+  .cm-content .cm-md-table-number { white-space: normal; }
 }
 
 /* ======= mermaid ======= */

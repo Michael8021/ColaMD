@@ -33,10 +33,15 @@ export interface MarkdownTable {
   align: string[]
 }
 
-/** 数字与金额：不拆行，算最小列宽时按整段计 */
+/** 数字与金额：放得下时不拆行，算最小列宽时按整段计 */
 const NUMERIC = /^[+-]?\d[\d,.]*%?$/
 
 const tableCache = new WeakMap<EditorState['doc'], Map<string, MarkdownTable>>()
+
+/** 列宽按占比写：打印时纸比窗口窄、脚本不会重算，占比不变才放得下；放不下时数字也拆行 */
+interface TableLayout { width: number; columns: number[]; wrapNumbers: boolean }
+
+const sum = (values: number[]) => values.reduce((total, value) => total + value, 0)
 
 function readRow(state: EditorState, node: SyntaxNode): TableRow {
   const text = state.sliceDoc(node.from, node.to)
@@ -280,7 +285,7 @@ const tableLayout = ViewPlugin.fromClass(class {
   private readonly measure = document.createElement('div')
   private readonly canvas = document.createElement('canvas').getContext('2d')!
   private readonly metrics = new Map<string, { min: number; max: number }>()
-  private readonly layouts = new WeakMap<MarkdownTable, { width: number; columns: number[] }>()
+  private readonly layouts = new WeakMap<MarkdownTable, TableLayout>()
   private readonly rules = new Map<number, string>()
   private probes: { key: string; min: HTMLElement; max: HTMLElement }[] = []
   private signature = ''
@@ -350,12 +355,14 @@ const tableLayout = ViewPlugin.fromClass(class {
         const wrapperStyle = getComputedStyle(wrapper)
         tables.set(table, wrapper.clientWidth - parseFloat(wrapperStyle.paddingLeft) - parseFloat(wrapperStyle.paddingRight))
       })
-      const layouts: { table: MarkdownTable; width: number; columns: number[] }[] = []
+      const layouts: (TableLayout & { table: MarkdownTable })[] = []
       for (const [table, width] of tables) {
         const cached = this.layouts.get(table)
         if (cached?.width === width && this.rules.has(table.from)) continue
         const minimum = table.align.map(() => parseFloat(style.minWidth))
         const preferred = [...minimum]
+        // 数字也允许拆行时的下限：整段数字放不下时退到这里，免得表格撑出正文、打印时被裁掉
+        const wrapped = [...minimum]
         table.rows.forEach((row, index) => row.cells.slice(0, table.align.length).forEach((cell, column) => {
           const text = view.state.sliceDoc(cell.start, cell.end)
           const header = index === 0
@@ -365,7 +372,7 @@ const tableLayout = ViewPlugin.fromClass(class {
           if (!metric && !/[\*_~`\[\]<>$\\&]/.test(text)) {
             this.canvas.font = font
             const measured = this.canvas.measureText(text).width + (parseFloat(style.letterSpacing) || 0) * text.length
-            metric = { min: NUMERIC.test(text) ? measured : 0, max: measured }
+            metric = { min: 0, max: measured }
             this.metrics.set(key, metric)
           }
           if (!metric) {
@@ -373,14 +380,17 @@ const tableLayout = ViewPlugin.fromClass(class {
             return
           }
           const padding = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight) + 2
-          minimum[column] = Math.max(minimum[column], metric.min + padding)
+          minimum[column] = Math.max(minimum[column], (NUMERIC.test(text) ? metric.max : metric.min) + padding)
+          wrapped[column] = Math.max(wrapped[column], metric.min + padding)
           preferred[column] = Math.max(preferred[column], metric.max + padding)
         }))
         if (pending.size) continue
-        const free = Math.max(0, width - minimum.reduce((sum, value) => sum + value, 0))
-        const flex = preferred.map((value, column) => value - minimum[column])
-        const total = flex.reduce((sum, value) => sum + value, 0)
-        layouts.push({ table, width, columns: minimum.map((value, column) => value + free * (total ? flex[column] / total : 1 / minimum.length)) })
+        const wrapNumbers = sum(minimum) > width
+        const floor = wrapNumbers ? wrapped : minimum
+        const free = Math.max(0, width - sum(floor))
+        const flex = preferred.map((value, column) => value - floor[column])
+        const total = sum(flex)
+        layouts.push({ table, width, wrapNumbers, columns: floor.map((value, column) => value + free * (total ? flex[column] / total : 1 / floor.length)) })
       }
       return { doc: view.state.doc, layouts, pending: [...pending].map(([key, value]) => ({ key, ...value })) }
     }, write: plan => {
@@ -389,7 +399,11 @@ const tableLayout = ViewPlugin.fromClass(class {
       if (!plan || plan.doc !== this.view.state.doc) return
       for (const layout of plan.layouts) {
         this.layouts.set(layout.table, layout)
-        this.rules.set(layout.table.from, layout.columns.map((width, column) => `[data-table-layout="${this.id}"] [data-table-from="${layout.table.from}"] .cm-md-table-cell[data-column="${column}"]{width:${width}px}`).join('\n'))
+        const table = `[data-table-layout="${this.id}"] [data-table-from="${layout.table.from}"]`
+        const total = sum(layout.columns)
+        const rules = layout.columns.map((width, column) => `${table} .cm-md-table-cell[data-column="${column}"]{width:${width / total * 100}%}`)
+        if (layout.wrapNumbers) rules.push(`${table} .cm-md-table-number{white-space:normal}`)
+        this.rules.set(layout.table.from, rules.join('\n'))
       }
       const css = [...this.rules.values()].join('\n')
       if (this.style.textContent !== css) this.style.textContent = css
