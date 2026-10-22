@@ -116,6 +116,8 @@ async function run(win, files) {
     const doc = `${prefix}${title}\n\n后续正文\n\n## 另一个标题\n末尾`
     const from = prefix.length, end = from + title.length, to = doc.indexOf('后续正文') + 4
     await sample(`H${level} 单独选完整标题按文字复制`, doc, from, end, title)
+    const titleOnly = await copy()
+    check(`H${level} 单独选字不带标题 HTML`, () => assert.ok(!/<h[1-6](?:>|\s)/.test(titleOnly.html), titleOnly.html))
     await sample(`H${level} 单独选部分文字`, doc, from + 1, end - 1, title.slice(1, -1))
     await sample(`H${level} 跨块正向复制`, doc, from, to, doc.slice(0, to), level)
     await sample(`H${level} 跨块反向复制`, doc, from, to, doc.slice(0, to), level, true)
@@ -124,6 +126,9 @@ async function run(win, files) {
     await sample(`H${level} 源码行首起选不重复标记`, doc, 0, to, doc.slice(0, to), level)
     await sample(`H${level} 从标记中间起选补完整前缀`, doc, 1, to, doc.slice(0, to), level)
     await sample(`H${level} 选中标题后换行`, doc, from, end + 1, doc.slice(0, end + 1), level)
+    await sample(`H${level} 反向选中标题后换行`, doc, from, end + 1, doc.slice(0, end + 1), level, true)
+    await sample(`H${level} 选中标题后两个换行`, doc, from, end + 2, doc.slice(0, end + 2), level)
+    await sample(`H${level} 反向选中标题后两个换行`, doc, from, end + 2, doc.slice(0, end + 2), level, true)
     await sample(`H${level} 连续跨多个标题`, doc, from, doc.length, doc, level)
     // 用户在同一文件粘贴后，原始 Markdown 层级要完整，且一笔撤销/重做。
     await reset(doc, from, to)
@@ -219,6 +224,10 @@ async function run(win, files) {
     ['带结束标记只选文字', '### ⟦末尾⟧ ###', '末尾'],
     ['带结束标记选到行尾', '### ⟦末尾 ###⟧', '末尾'],
     ['带结束标记跨块', '### ⟦末尾 ###\n\n正文⟧', '### 末尾 ###\n\n正文'],
+    ['加粗标题后换行', '### ⟦**加粗标题**\n⟧\n正文', '### **加粗标题**\n', ['<h3>', '<strong>加粗标题</strong>']],
+    ['链接标题后换行', '### ⟦[链接标题](https://example.com)\n⟧\n正文', '### [链接标题](https://example.com)\n', ['<h3>', '<a href="https://example.com">']],
+    ['颜色标题后换行', '### ⟦<span style="color:#ff0000">颜色标题</span>\n⟧\n正文', '### <span style="color:#ff0000">颜色标题</span>\n', ['<h3>', 'color:']],
+    ['标题中间到换行不补未选文字', '### 未选⟦标题\n⟧\n正文', '### 标题\n', ['<h3>标题</h3>', '!未选']],
     // 列表：跨项保留结构，只在一项里选只给文字
     ['无序列表跨项', '- ⟦苹果\n- 香蕉\n- 橙子⟧', '- 苹果\n- 香蕉\n- 橙子', '<ul>'],
     ['无序列表一项', '- ⟦苹果⟧\n- 香蕉', '苹果', ['<p>苹果</p>']],

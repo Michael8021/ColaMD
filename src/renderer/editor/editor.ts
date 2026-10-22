@@ -428,15 +428,7 @@ function selectionRange(view: EditorView, ranges: readonly SelectionRange[]): Ra
 function selectionHTML(view: EditorView, ranges: readonly SelectionRange[]): string {
   const range = selectionRange(view, ranges)
   const fragment = range.cloneContents()
-  // 整段选区都在里面的引用、列表项、标题不带出来，和原文口味一致（见 copy-markdown.ts）
   const inside = enclosingForHTML(view.state, ranges[0].from, ranges[ranges.length - 1].to)
-  for (const line of fragment.querySelectorAll<HTMLElement>('.cm-line')) {
-    if (inside.quote) line.classList.remove('cm-md-blockquote')
-    for (const depth of inside.listDepths) {
-      if (line.classList.contains(`cm-md-li-${depth}`)) line.classList.remove('cm-md-li', `cm-md-li-${depth}`, 'cm-md-li-start', 'cm-md-li-ordered')
-    }
-    if (inside.heading) for (let level = 1; level <= 6; level++) line.classList.remove(`cm-md-atxheading${level}`)
-  }
   let content: Node = fragment
   // 选区整个落在一段格式文字里（只选了加粗的一半）：cloneContents 只给出字，
   // 外面那几层格式要补回来，和原文口味补上的 `**` 一致。
@@ -448,9 +440,25 @@ function selectionHTML(view: EditorView, ranges: readonly SelectionRange[]): str
     content = shell
     node = node.parentNode
   }
-  if (content instanceof DocumentFragment) return selectionHTMLFrom(content)
+  // 分隔换行可能被装饰隐藏：源码选区已跨出标题，DOM 区间却仍在标题行里。
+  // 只恢复缺失的标题外壳，文字仍取选中片段；其它行不因此变成块级复制。
+  if (!inside.heading && node instanceof HTMLElement &&
+      Array.from(node.classList).some(name => /^cm-md-atxheading[1-6]$/.test(name)) && content.textContent?.trim()) {
+    const shell = node.cloneNode(false)
+    shell.appendChild(content)
+    content = shell
+  }
   const wrapped = document.createDocumentFragment()
   wrapped.appendChild(content)
+  // 整段选区都在里面的引用、列表项、标题不带出来，和原文口味一致（见 copy-markdown.ts）。
+  // 在补完外壳之后统一处理，避免刚补的外壳又带回不该保留的外层类型。
+  for (const line of wrapped.querySelectorAll<HTMLElement>('.cm-line')) {
+    if (inside.quote) line.classList.remove('cm-md-blockquote')
+    for (const depth of inside.listDepths) {
+      if (line.classList.contains(`cm-md-li-${depth}`)) line.classList.remove('cm-md-li', `cm-md-li-${depth}`, 'cm-md-li-start', 'cm-md-li-ordered')
+    }
+    if (inside.heading) for (let level = 1; level <= 6; level++) line.classList.remove(`cm-md-atxheading${level}`)
+  }
   return selectionHTMLFrom(wrapped)
 }
 
