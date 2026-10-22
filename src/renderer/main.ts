@@ -10,7 +10,7 @@ import { enterPaperLayout, exitPaperLayout } from './print-layout'
 import { SearchPanel } from './editor/search-panel'
 import { applyTheme, loadSavedTheme, onThemeChange } from './themes/theme-manager'
 import { setUiLanguage, isChinese, type UiLanguage } from './ui-language'
-import { applyEditorFont, clearEditorFont, loadSavedEditorFont, resetEditorFontSize, showFontSettingsModal, stepEditorFontSize } from './editor/font-settings'
+import { applyEditorFont, clearEditorFont, loadSavedEditorFont, onEditorFontChange, resetEditorFontSize, showFontSettingsModal, stepEditorFontSize } from './editor/font-settings'
 import './themes/base.css'
 import './themes/premium.css'
 import './themes/editor-preview.css'
@@ -1854,8 +1854,9 @@ async function init(): Promise<void> {
   const language = await api.getLanguage()
   fileManagerName = await api.getFileManagerName()
   setUiLanguage(language)
-  // 主题只换 body 上的类和样式表，编辑器察觉不到字体变了，要外壳告诉它
+  // 主题和字体设置只换 body 上的类和样式，编辑器察觉不到字宽变了，要外壳告诉它
   onThemeChange(remeasureEditor)
+  onEditorFontChange(remeasureEditor)
   const savedTheme = loadSavedTheme()
   if (savedTheme.startsWith('custom:')) {
     // Load before applying: a newly opened window must not briefly paint the

@@ -607,7 +607,8 @@ body.exporting .cm-content .cm-md-frontmatter {
     display: none !important;
   }
 
-  /* 纸比窗口窄，打印时脚本不会重排：列宽按占比缩小，放不下的数字拆行，不裁到纸外 */
+  /* 纸比窗口窄，打印时脚本不会重排：列宽按屏幕上的占比缩小，数字放不下就拆行，不裁到纸外。
+   * 代价是屏幕上刚好放下的金额在纸上也可能拆成两行，比被裁掉好 */
   .cm-content .cm-md-table-number { white-space: normal; }
 }
 
