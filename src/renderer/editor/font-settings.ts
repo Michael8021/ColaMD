@@ -1,4 +1,5 @@
 import { isChinese } from '../ui-language'
+import { remeasureEditor } from './editor'
 
 // Layering: user preference > theme > built-in defaults. Themes keep their own
 // font rules; a body class + CSS variables override only the editor prose and
@@ -49,6 +50,8 @@ export function applyEditorFont(prefs: EditorFontPrefs | null): void {
   else body.style.removeProperty('--editor-font')
   if (size) body.style.setProperty('--editor-font-size', `${size}px`)
   else body.style.removeProperty('--editor-font-size')
+  // 只换字体族时编辑器的尺寸不变，察觉不到字宽变了：和换主题一样重测，表格列宽才会跟着更新
+  remeasureEditor()
 }
 
 export function persistEditorFont(prefs: EditorFontPrefs): void {
