@@ -501,6 +501,30 @@ try {
   check('多格粘贴以反斜杠结尾不转义竖线', await doc() === `|A|B|\n|---|---|\n|p${S}${S}|q${S}${S}|\n` && same(await rowCells(1), [`p${S}`, `q${S}`]), await doc())
   await setDoc(fixture)
 
+  // 紧凑表格的格尾和右侧竖线是同一个位置：各种方式把光标放到格尾再输入，字都留在这一格
+  const tight = '|A|B|\n|---|---|\n|xy|zw|\n'
+  const tightEnd = tight.indexOf('xy') + 2
+  for (const [name, place] of [
+    ['Tab 选中后按右方向键', async () => { await cursor(tight.indexOf('zw'), 1); await key('Tab', 8); await key('ArrowRight') }],
+    ['程序放在格尾的光标', () => cursor(tightEnd)],
+    ['从下一格按左方向键', async () => { await cursor(tight.indexOf('zw'), 1); await key('ArrowLeft') }],
+  ]) {
+    await setDoc(tight)
+    await place()
+    await type('q')
+    check(`紧凑表格${name}后输入留在当前格`, await doc() === tight.replace('xy', 'xyq'), await doc())
+  }
+  await setDoc(tight)
+  await cursor(tightEnd, -1)
+  await type('|')
+  await type('q')
+  check('格尾输入竖线后接着输入仍在当前格', await doc() === tight.replace('xy', `xy${S}|q`), await doc())
+  await setDoc(tight)
+  await cursor(tight.indexOf('zw'), 1)
+  await type(S)
+  check('紧凑表格格首输入反斜杠留在当前格', await doc() === tight.replace('zw', `${S}zw`) && same(await rowCells(1), ['xy', `${S}zw`]), await doc())
+  await setDoc(fixture)
+
   // 同一行跨格复制：富文本口味是选中的这几格组成的一行表格，没选到的字不补进去
   const copyRow = '| 名称 | 数量 | 备注 |\n|---|---:|---|\n| 苹果 | 12 |  |\n'
   const copyEvent = () => evaluate(`(() => { const data = new DataTransfer(); v.contentDOM.dispatchEvent(new ClipboardEvent('copy', {clipboardData: data, bubbles: true, cancelable: true})); return {plain: data.getData('text/plain'), html: data.getData('text/html')} })()`)

@@ -734,17 +734,22 @@ export const tableEditing = [
   tableField,
   tableLayout,
   EditorState.transactionFilter.of(tr => {
-    if (!tr.selection || !tr.newSelection.main.empty || tr.docChanged || tr.effects.some(effect => effect.is(setVirtualCell))) return tr
+    if (!tr.selection || !tr.newSelection.main.empty || tr.effects.some(effect => effect.is(setVirtualCell))) return tr
     const current = currentCell(tr.state)
     if (!current) return tr
     const { table, row, cell } = current
-    const pos = tr.newSelection.main.head
-    let anchor = cell ? Math.max(cell.start, Math.min(cell.end, pos)) : table.rows[row].to
-    // 隐藏的转义符和它后面的字之间看不出位置：方向键越过这一对，点击落在它前面
-    if (cell && hiddenEscapes(tr.state, cell).includes(anchor - 1)) {
-      anchor += !tr.isUserEvent('select.pointer') && anchor > tr.startState.selection.main.head ? 1 : -1
+    const { head: pos, assoc } = tr.newSelection.main
+    let anchor = pos
+    if (!tr.docChanged) {
+      anchor = cell ? Math.max(cell.start, Math.min(cell.end, pos)) : table.rows[row].to
+      // 隐藏的转义符和它后面的字之间看不出位置：方向键越过这一对，点击落在它前面
+      if (cell && hiddenEscapes(tr.state, cell).includes(anchor - 1)) {
+        anchor += !tr.isUserEvent('select.pointer') && anchor > tr.startState.selection.main.head ? 1 : -1
+      }
     }
-    return anchor === pos ? tr : [tr, { selection: { anchor } }]
+    // 光标贴住格里的字：紧凑表格 `|xy|zw|` 的格尾就是右侧竖线的位置，不贴前面的字，光标会画到竖线之后，接着输入的字落进下一格
+    const side = cell && cell.start < cell.end && (anchor === cell.end || anchor === cell.start) ? (anchor === cell.end ? -1 : 1) : assoc
+    return anchor === pos && side === assoc ? tr : [tr, { selection: EditorSelection.create([EditorSelection.cursor(anchor, side)]), sequential: true }]
   }),
   EditorState.changeFilter.of(tr => {
     if (!tr.isUserEvent('delete') && !tr.isUserEvent('input')) return true
