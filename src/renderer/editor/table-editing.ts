@@ -1470,6 +1470,9 @@ const tableCompositionInput = ViewPlugin.fromClass(class {
 
 /** 切换标签、源码模式前提交当前 DOM 输入，快照不能带走未收口的组字状态。 */
 export function finishTableComposition(view: EditorView): void {
+  const input = view.dom.ownerDocument.activeElement
+  // 空格和缺省格拥有独立输入节点；先通过它自己的 blur 提交，再读取标签或源码快照。
+  if (input instanceof HTMLElement && input.closest('.cm-md-table-input') && view.contentDOM.contains(input)) input.blur()
   if (!view.state.field(tableComposition, false)) return
   view.contentDOM.blur()
   view.plugin(tableCompositionInput)?.finish()

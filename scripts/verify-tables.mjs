@@ -216,6 +216,27 @@ try {
         check(`组字期间切${mode}后可继续输入`, await doc() === original.replace('x', '甲\\|乙Zx'), await doc())
       }
     },
+    async imeWidgetLifecycle() {
+      for (const [kind, original, column, expected] of [
+        ['空格', '| A | B |\n|---|---|\n|   | y |\n', 0, '| A | B |\n|---|---|\n| 甲\\|乙 | y |\n'],
+        ['缺省格', '| A | B |\n|---|---|\n| z |\n', 1, '| A | B |\n|---|---|\n| z | 甲\\|乙 |\n'],
+      ]) for (const mode of ['源码', '标签']) {
+        await setDoc(original)
+        await clickCell(1, column)
+        await send('Input.imeSetComposition', { text: '甲|乙', selectionStart: 3, selectionEnd: 3 })
+        await evaluate(`document.querySelector(${JSON.stringify(mode === '源码' ? '#source-toggle-btn' : '.tab-new-btn')}).click()`)
+        if (mode === '源码') {
+          check(`${kind} 组字期间切源码包含当前文字`, await evaluate(`document.getElementById('source-editor').value`) === expected, await evaluate(`document.getElementById('source-editor').value`))
+          await evaluate(`document.getElementById('source-toggle-btn').click()`)
+        } else {
+          for (let i = 0; i < 50 && await doc() !== ''; i++) await sleep(20)
+          check(`${kind} 组字期间新标签保持空白`, await doc() === '')
+          await evaluate(`document.querySelector('.tab-entry').click()`)
+        }
+        await sleep(100)
+        check(`${kind} 组字期间切${mode}往返字节正确`, await doc() === expected, await doc())
+      }
+    },
     async imeLayout() {
       const original = '| A | B |\n|---|---|\n| 1 | label |\n'
       const digits = '1234567890'.repeat(14)
