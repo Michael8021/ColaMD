@@ -163,6 +163,26 @@ try {
         check(`输入法提交 ${JSON.stringify(text)} 一步撤销`, await doc() === original, await doc())
       }
     },
+    async imeLayout() {
+      const original = '| A | B |\n|---|---|\n| 1 | label |\n'
+      const digits = '1234567890'.repeat(14)
+      await setDoc(original)
+      const before = await evaluate(`[...v.contentDOM.querySelectorAll('.cm-md-table-header .cm-md-table-cell')].map(cell => cell.getBoundingClientRect().width)`)
+      await select('1', 0, 1)
+      await send('Input.imeSetComposition', { text: digits.slice(0, 20), selectionStart: 20, selectionEnd: 20 })
+      await sleep(60)
+      await evaluate('window.numberCompositionNode = getSelection().anchorNode; undefined')
+      await send('Input.imeSetComposition', { text: digits, selectionStart: digits.length, selectionEnd: digits.length })
+      await sleep(60)
+      check('数字组字不重建输入节点', await evaluate('numberCompositionNode.isConnected && numberCompositionNode === getSelection().anchorNode'))
+      await send('Input.insertText', { text: digits })
+      await sleep(250)
+      const layout = await evaluate(`(() => {const cell=v.contentDOM.querySelector('.cm-md-table-number');return {widths:[...v.contentDOM.querySelectorAll('.cm-md-table-header .cm-md-table-cell')].map(cell => cell.getBoundingClientRect().width),wrap:getComputedStyle(cell).whiteSpace,overflow:cell.scrollWidth-cell.clientWidth}})()`)
+      check('无转义修正的输入法提交仍更新数字换行并保留列宽', layout.wrap !== 'nowrap' && layout.overflow <= 1 && before.every((width, i) => Math.abs(width - layout.widths[i]) <= 1), JSON.stringify({before,layout}))
+      check('数字输入法提交只改当前格', await doc() === original.replace('| 1 |', `| ${digits} |`), await doc())
+      await key('z', MOD)
+      check('数字输入法提交一步撤销', await doc() === original, await doc())
+    },
     async keys() {
       const original = '- | A | B |\n  |---|---|\n  | x | y |\n'
       for (const [name, modifiers, expected] of [['Tab', 0, 'B'], ['Tab', 8, 'A']]) {

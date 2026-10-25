@@ -478,11 +478,12 @@ const tableLayout = ViewPlugin.fromClass(class {
   update(update: ViewUpdate): void {
     const reconfigured = update.transactions.some(tr => tr.reconfigured && !tr.annotation(tableGeometryUpdate))
     if (reconfigured) this.signature = ''
-    if (update.state.field(tableComposition, false)) return
+    const composing = !!update.state.field(tableComposition, false)
+    const compositionEnded = update.transactions.some(tr => tr.effects.some(effect => effect.is(setTableComposition) && !effect.value))
     if (update.docChanged) {
-      const localRows = update.transactions.every(tr => !tr.docChanged || !!changedTableRow(tr))
-      let numericChanged = false
-      if (localRows) for (const tr of update.transactions) tr.changes.iterChanges((from, to, next, end) => {
+      const localRows = composing || update.transactions.every(tr => !tr.docChanged || !!changedTableRow(tr))
+      let numericChanged = composing
+      if (localRows && !composing) for (const tr of update.transactions) tr.changes.iterChanges((from, to, next, end) => {
         const before = cellAround(tr.startState, from, to), after = cellAround(tr.state, next, end)
         if ([before && tr.startState.sliceDoc(before.start, before.end), after && tr.state.sliceDoc(after.start, after.end)].some(text => text && NUMERIC.test(text))) numericChanged = true
       })
@@ -502,7 +503,7 @@ const tableLayout = ViewPlugin.fromClass(class {
           continue
         }
         if (localRows) {
-          retained.set(mapped, { ...layout, length: update.changes.mapPos(from + layout.length, -1) - mapped,
+          retained.set(mapped, { ...layout, length: update.changes.mapPos(from + layout.length, composing ? 1 : -1) - mapped,
             boundaries: layout.boundaries.map((pos, index) => update.changes.mapPos(from + pos, index % 2 ? 1 : -1) - mapped) })
           if (!numericChanged) retainRule(from, mapped)
           continue
@@ -522,7 +523,7 @@ const tableLayout = ViewPlugin.fromClass(class {
       this.rules.clear()
       for (const [from, css] of rules) this.rules.set(from, css)
     }
-    if (reconfigured || update.docChanged || update.viewportChanged || update.geometryChanged) this.schedule()
+    if (!composing && (compositionEnded || reconfigured || update.docChanged || update.viewportChanged || update.geometryChanged)) this.schedule()
   }
 
   private content(cell: TableCell): HTMLElement {
@@ -556,6 +557,7 @@ const tableLayout = ViewPlugin.fromClass(class {
 
   private schedule(): void {
     this.view.requestMeasure({ key: this, read: view => {
+      if (view.state.field(tableComposition, false)) return null
       for (const probe of this.probes) this.metrics.set(probe.key, { min: probe.min.getBoundingClientRect().width, max: probe.max.getBoundingClientRect().width })
       const sample = view.contentDOM.querySelector<HTMLElement>('.cm-md-table-cell')
       if (!sample) {
