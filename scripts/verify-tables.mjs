@@ -37,10 +37,10 @@ try {
   await new Promise((resolve, reject) => { ws.addEventListener('open', resolve); ws.addEventListener('error', reject) })
   let id = 0
   const pending = new Map()
-  ws.addEventListener('message', event => {
+  ws.addEventListener('message', async event => {
     const message = JSON.parse(event.data)
     if (message.method === 'Runtime.exceptionThrown') errors.push(message.params.exceptionDetails)
-    if (message.method === 'Runtime.consoleAPICalled' && message.params.type === 'error') errors.push(message.params.args.map(arg=>arg.description || arg.value))
+    if (message.method === 'Runtime.consoleAPICalled' && message.params.type === 'error') errors.push({ message: message.params.args.map(arg=>arg.description || arg.value), context: await evaluate(`({ text: v.state.doc.toString().slice(0, 120), orphans: [...v.contentDOM.querySelectorAll('.cm-md-table-row')].filter(row => !row.closest('.cm-md-table-widget')).map(row => row.textContent) })`) })
     if (!message.id) return
     const request = pending.get(message.id)
     pending.delete(message.id)
@@ -124,6 +124,171 @@ try {
   const exportHTML = () => evaluate('window.__colamdExportDocumentHTML()')
   const head = () => evaluate('v.state.selection.main.head')
 
+  // 每个缺陷可单独运行，避免首条失败挡住其余修复前证据。
+  const regression = process.argv.find(arg => arg.startsWith('--regression='))?.split('=')[1]
+  const regressions = {
+    async empty() {
+      const original = '| A | B |\n|---|---|\n|   | `c|d` |\n'
+      await setDoc(original)
+      await clickCell(1, 0)
+      await type('`')
+      check('空格子反引号按整行保护邻格代码', await doc() === original.replace('|   |', '| \\` |'), await doc())
+      await key('z', MOD)
+      check('空格子整行保护一步撤销', await doc() === original, await doc())
+    },
+    async missing() {
+      const original = '| A | B | C |\n|---|---|---|\n| a`b |\n'
+      await setDoc(original)
+      await clickCell(1, 1)
+      await type('`c|d`')
+      check('缺省格代码补齐格线并保护原格反引号', await doc() === original.replace('| a`b |', '| a\\`b | `c|d` |  |'), await doc())
+      await key('z', MOD)
+      check('缺省格补齐和保护一步撤销', await doc() === original, await doc())
+    },
+    async ime() {
+      const original = '| A | B |\n|---|---|\n| x | `c|d` |\n'
+      for (const [text, expected] of [['甲|乙', '甲\\|乙'], ['甲`', '甲\\`'], ['甲\\', '甲\\']]) {
+        await setDoc(original)
+        await select('x')
+        await send('Input.imeSetComposition', { text: text.slice(0, 1), selectionStart: 1, selectionEnd: 1 })
+        await sleep(60)
+        await evaluate(`window.compositionNode = getSelection().anchorNode; undefined`)
+        await send('Input.imeSetComposition', { text, selectionStart: text.length, selectionEnd: text.length })
+        await sleep(60)
+        check(`组字 ${JSON.stringify(text)} 不重建输入节点`, await evaluate('compositionNode.isConnected && getSelection().anchorNode === compositionNode'))
+        await send('Input.insertText', { text })
+        await sleep(180)
+        check(`输入法提交 ${JSON.stringify(text)} 保护格线和邻格代码`, await doc() === original.replace('| x |', `| ${expected}x |`), await doc())
+        await key('z', MOD)
+        check(`输入法提交 ${JSON.stringify(text)} 一步撤销`, await doc() === original, await doc())
+      }
+    },
+    async keys() {
+      const original = '- | A | B |\n  |---|---|\n  | x | y |\n'
+      for (const [name, modifiers, expected] of [['Tab', 0, 'B'], ['Tab', 8, 'A']]) {
+        await setDoc(original)
+        await select(modifiers ? 'B' : 'A')
+        await key(name, modifiers)
+        check(`列表表头 ${modifiers ? 'Shift+Tab' : 'Tab'} 由表格导航接管`, await doc() === original && await evaluate('v.state.sliceDoc(v.state.selection.main.from,v.state.selection.main.to)') === expected, await doc())
+      }
+      await setDoc(original)
+      await select('A')
+      await key('Enter')
+      check('列表表头 Enter 在同列表格下一行', await doc() === original && await evaluate('v.state.selection.main.from') === original.indexOf('x'), await doc())
+      await setDoc(original)
+      await select('A', 1)
+      await key('Enter', 8)
+      check('列表表头 Shift+Enter 在格内换行', await doc() === original.replace('A', 'A<br>'), await doc())
+      await setDoc(original)
+      await select('A')
+      await key('Enter', MOD)
+      check('列表表头 Mod+Enter 增行且不增加列表项', (await doc()).split('\n').length === original.split('\n').length + 1 && (await doc()).startsWith('- | A | B |\n  |---|---|\n  |  |  |'), await doc())
+      await setDoc('正文\n\n- 列表\n')
+      await select('列表')
+      await key('Enter')
+      check('表格外 Enter 继续由列表处理', (await doc()).includes('\n- \n'), await doc())
+    },
+    async shift() {
+      const original = '| A | B | C |\n|---|---|---|\n| x |   | z |\n'
+      for (const direction of ['ArrowLeft', 'ArrowRight']) {
+        await setDoc(original)
+        await clickCell(1, 1)
+        const anchor = await head()
+        await key(direction, 8)
+        check(`空格子 Shift+${direction} 保留锚点扩选`, await evaluate(`v.state.selection.main.anchor === ${anchor} && v.state.selection.main.head ${direction === 'ArrowLeft' ? '<' : '>'} ${anchor}`))
+        check(`空格子 Shift+${direction} 不修改原文`, await doc() === original)
+      }
+    },
+    async tsv() {
+      const original = '| A | B |\n|---|---|\n' + '| a`b | old |\n'.repeat(160)
+      await setDoc(original)
+      await select('old', 0, 3)
+      await evaluate(`window.rowScans = 0; window.originalIndexOf = Array.prototype.indexOf; Array.prototype.indexOf = function(value, ...rest) { if(value && typeof value === 'object' && ('cells' in value || ('insert' in value && 'from' in value))) rowScans += this.length; return originalIndexOf.call(this, value, ...rest) }`)
+      try {
+        await paste(Array.from({length:160}, () => '`c|d`\textra').join('\n'))
+      } finally {
+        await evaluate('Array.prototype.indexOf = originalIndexOf')
+      }
+      check('大批 TSV 扩列仍逐行保护反引号', (await doc()).split('\n').slice(2, -1).every(line => line === '| a\\`b | `c|d` | extra |'), (await doc()).slice(0, 200))
+      check('TSV 和整行保护不反复线性查找行或编辑', await evaluate('rowScans') === 0, await evaluate('rowScans'))
+      await key('z', MOD)
+      check('大批 TSV 整体一步撤销', await doc() === original)
+    },
+    async incremental() {
+      const original = '正文。\n\n| A | B |\n|---|---|\n' + '| item | value |\n'.repeat(600)
+      for (const target of ['正文', 'A', 'item']) {
+        await setDoc(original)
+        await select(target, 1)
+        await evaluate(`(() => {
+          window.tableDecoRefs = v.state.facet(v.constructor.outerDecorations).filter(set => set.between).flatMap(set => {
+            const refs = []; set.between(v.state.doc.length - 30, v.state.doc.length - 1, (_from,_to,deco) => { if(deco.spec.class?.includes('cm-md-table')) refs.push(deco) }); return refs;
+          });
+          window.slicedCharacters = 0; window.tableSlicedCharacters = 0; window.textPrototype = Object.getPrototypeOf(v.state.doc); window.originalSlice = textPrototype.sliceString;
+          textPrototype.sliceString = function(from, to = this.length, ...args) { slicedCharacters += to - from; if(/readRow|hiddenEscapes|cellEditContext|tableDecorations|readTable/.test(new Error().stack)) tableSlicedCharacters += to - from; return originalSlice.call(this, from, to, ...args) };
+        })()`)
+        try {
+          await evaluate(`(() => {const h=v.state.selection.main.head;v.dispatch({changes:{from:h,insert:'X'},selection:{anchor:h+1},userEvent:'input.type'})})()`)
+        } finally { await evaluate('textPrototype.sliceString = originalSlice') }
+        const refs = await evaluate(`(() => {const refs = v.state.facet(v.constructor.outerDecorations).filter(set => set.between).flatMap(set => {const found=[];set.between(v.state.doc.length-30,v.state.doc.length-1,(_from,_to,deco)=>{if(deco.spec.class?.includes('cm-md-table'))found.push(deco)});return found});return {total:tableDecoRefs.length,reused:tableDecoRefs.filter(deco=>refs.includes(deco)).length,sliced:slicedCharacters, tableSliced:tableSlicedCharacters}})()`)
+        check(`${target} 编辑复用未改行装饰`, refs.total > 0 && refs.reused === refs.total, JSON.stringify(refs))
+        check(`${target} 编辑不读取整张表的所有格子`, refs.tableSliced < original.length / 3, JSON.stringify(refs))
+      }
+    },
+    async reset() {
+      await setDoc('| A | B |\n|---|---|\n| x | y |\n')
+      await setDoc('正文\n')
+      check('整篇替换后没有旧表格行装饰', await evaluate(`v.contentDOM.querySelectorAll('.cm-md-table-row').length`) === 0)
+      await setDoc('| C | D |\n|---|---|\n| new | table |\n')
+      check('整篇替换后每行均在当前表格 wrapper 内', await evaluate(`[...v.contentDOM.querySelectorAll('.cm-md-table-row')].every(row => row.closest('.cm-md-table-widget'))`))
+    },
+    async image() {
+      await setTheme('elegant')
+      await setDoc('| 数字 | 说明 |\n|---|---|\n| 123456789012345678901234567890123456789012345678901234567890 | 短 |\n')
+      await mainEval(`(() => {
+        const {BrowserWindow, dialog} = ${ELECTRON}; const fs = process.getBuiltinModule('fs');
+        globalThis.tableImageProbe = null;
+        globalThis.originalTableLoad = BrowserWindow.prototype.loadFile;
+        globalThis.originalTableSave = dialog.showSaveDialog;
+        globalThis.originalTableMessage = dialog.showMessageBox;
+        globalThis.originalTableShow = BrowserWindow.prototype.show;
+        globalThis.originalTableFocus = BrowserWindow.prototype.focus;
+        BrowserWindow.prototype.show = function() {}; BrowserWindow.prototype.focus = function() {};
+        dialog.showSaveDialog = async () => ({canceled:false,filePath:${JSON.stringify(join(dir, 'table-mobile.png'))}});
+        dialog.showMessageBox = async () => ({response:0});
+        BrowserWindow.prototype.loadFile = async function(path, ...args) {
+          const result = await originalTableLoad.call(this, path, ...args);
+          if(path.includes('colamd-image-export-')) {
+            globalThis.tableImageHTML = fs.readFileSync(path, 'utf8');
+            globalThis.tableImageProbe = await this.webContents.executeJavaScript(\`(() => {
+              const content = document.querySelector('.cm-content'), table = content.querySelector('.cm-md-table-widget');
+              const rules = [...document.styleSheets].flatMap(sheet => [...sheet.cssRules]).filter(rule => rule.selectorText?.includes('[data-table-layout=') && rule.style.width);
+              return { rules: rules.length, matched: rules.filter(rule => document.querySelector(rule.selectorText)).length,
+                right:table.getBoundingClientRect().right, limit:content.getBoundingClientRect().right,
+                numbers:[...document.querySelectorAll('.cm-md-table-number')].map(cell => getComputedStyle(cell).whiteSpace) };
+            })()\`);
+          }
+          return result;
+        };
+      })()`)
+      try {
+        await sendToWindow('menu-export-image', 'mobile')
+        let probe
+        for (let i=0;i<150;i++) { probe = await mainEval('globalThis.tableImageProbe'); if(probe) break; await sleep(100) }
+        check('真实图片导出 HTML 的列宽规则命中作用域', probe?.rules > 0 && probe.matched === probe.rules, JSON.stringify(probe))
+        check('手机图片导出长数字不超出正文右边界', probe.right <= probe.limit + 1 && probe.numbers.every(value => value === 'normal'), JSON.stringify(probe))
+        for (let i=0;i<150;i++) { if(await mainEval(`${ELECTRON}.BrowserWindow.getAllWindows().length === 1`)) break; await sleep(100) }
+      } finally {
+        await mainEval(`(() => { const {BrowserWindow,dialog}=${ELECTRON}; BrowserWindow.prototype.loadFile=originalTableLoad; BrowserWindow.prototype.show=originalTableShow; BrowserWindow.prototype.focus=originalTableFocus; dialog.showSaveDialog=originalTableSave; dialog.showMessageBox=originalTableMessage })()`)
+      }
+    },
+  }
+  for (const [name, run] of Object.entries(regressions)) if (!regression || name === regression) { await run(); check(`${name} 回归没有运行时异常`, errors.length === 0, JSON.stringify(errors)) }
+  if (regression) {
+    check('运行时没有异常', errors.length === 0, JSON.stringify(errors))
+    console.log(`\n${passed} 项表格回归检查通过`)
+    process.exitCode = 0
+  } else {
+  await setDoc(fixture)
   check('打开表格不修改原文', await doc() === fixture, JSON.stringify({doc:await doc(), errors}))
   check('表格按原有对齐方式显示', await evaluate(`Array.from(document.querySelectorAll('.cm-md-table-header .cm-md-table-cell')).map(c=>getComputedStyle(c).textAlign).join(',')`) === 'left,center,right')
   const selectionFixture = '段落。\n\n| 名称 | 数量 | 说明 |\n| :--- | ---: | :--- |\n| 苹果 | 12 | **加粗** 与 `代码` |\n|  | 3 | 空格子 |\n\n> 引用开头\n>\n> | 日期 | 事项 |\n> | --- | --- |\n> | 周一 | 整理 |\n>\n> 引用结尾\n\n结尾。\n'
@@ -1228,6 +1393,7 @@ try {
   await sleep(1200)
   check('自动保存与缓冲区一致', readFileSync(file, 'utf8') === fixture)
   console.log(`\n${passed} 项表格检查通过`)
+  }
 } finally {
   ws?.close()
   mainWS?.close()

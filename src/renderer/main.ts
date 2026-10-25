@@ -1688,6 +1688,7 @@ function getExportSnapshot(content: string): {
   styles: string
   bodyClass: string
   background: string
+  tableLayout: string
 } {
   let styles = ''
   for (const sheet of Array.from(document.styleSheets)) {
@@ -1705,6 +1706,7 @@ function getExportSnapshot(content: string): {
     // 图片与 PDF 导出要的是「和屏幕上一模一样」，所以仍旧交编辑器那份 DOM；
     // HTML 导出交的是**一篇文档**：语义标签，没有编辑器自己的类名和行结构。
     html: editorRoot?.innerHTML ?? '',
+    tableLayout: editorRoot?.dataset.tableLayout ?? '',
     document: editorRoot ? documentHTMLFrom(editorRoot) : '',
     styles,
     bodyClass: Array.from(document.body.classList)

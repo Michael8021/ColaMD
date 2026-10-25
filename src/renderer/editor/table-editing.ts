@@ -72,6 +72,13 @@ function readRow(state: EditorState, node: SyntaxNode): TableRow {
   return { from: node.from, to: node.to, cells, trailing }
 }
 
+function rowAlignment(state: EditorState, row: TableRow): string[] {
+  return row.cells.map(cell => {
+    const text = state.sliceDoc(cell.start, cell.end)
+    return text.endsWith(':') ? (text.startsWith(':') ? 'center' : 'right') : 'left'
+  })
+}
+
 export function readTable(state: EditorState, node: SyntaxNode): MarkdownTable {
   const key = `${node.from}:${node.to}`
   let cache = tableCache.get(state.doc)
@@ -83,10 +90,7 @@ export function readTable(state: EditorState, node: SyntaxNode): MarkdownTable {
     if (child.name === 'TableHeader' || child.name === 'TableRow') rows.push(readRow(state, child))
     else if (child.name === 'TableDelimiter') delimiter = readRow(state, child)
   }
-  const align = delimiter.cells.map(cell => {
-    const text = state.sliceDoc(cell.start, cell.end)
-    return text.endsWith(':') ? (text.startsWith(':') ? 'center' : 'right') : 'left'
-  })
+  const align = rowAlignment(state, delimiter)
   const table = { from: node.from, to: node.to, rows, delimiter, align }
   if (!cache) tableCache.set(state.doc, cache = new Map())
   cache.set(key, table)
@@ -139,7 +143,7 @@ class EmptyTableCell extends WidgetType {
         event.stopPropagation()
         view.focus()
         if (event.key === 'ArrowUp' || event.key === 'ArrowDown') moveVertical(view, event.key === 'ArrowUp' ? -1 : 1, event.shiftKey)
-        else moveAcrossCell(view, event.key === 'ArrowLeft' ? -1 : 1)
+        else moveAcrossCell(view, event.key === 'ArrowLeft' ? -1 : 1, event.shiftKey)
       } else if (event.key === 'Tab' || event.key === 'Enter') {
         event.preventDefault()
         event.stopPropagation()
@@ -285,15 +289,22 @@ function eachTable(state: EditorState, visit: (node: SyntaxNode) => void): void 
   const front = state.doc.sliceString(0, 3) === '---' ? frontmatterRange(state.doc.toString()) : null
   syntaxTree(state).iterate({ enter: node => {
     if (front && node.name !== 'Document' && node.from >= front.from && node.from < front.to) return false
-    if (node.name !== 'Table') return
-    visit(node.node)
-    return false
+    if (node.name === 'Table') { visit(node.node); return false }
+    return ['Document', 'Blockquote', 'BulletList', 'OrderedList', 'ListItem'].includes(node.name)
   } })
 }
 
-function tableWrappers(state: EditorState) {
+interface TableRange { from: number; to: number }
+
+function tableNodes(state: EditorState): SyntaxNode[] {
+  const nodes: SyntaxNode[] = []
+  eachTable(state, node => nodes.push(node))
+  return nodes
+}
+
+function tableWrappers(state: EditorState, tables: TableRange[]) {
   const wrappers: Range<BlockWrapper>[] = []
-  eachTable(state, node => {
+  for (const node of tables) {
     const first = state.doc.lineAt(node.from).from
     const classes: string[] = []
     state.field(livePreviewField).between(first, first, (_from, _to, deco) => {
@@ -301,7 +312,7 @@ function tableWrappers(state: EditorState) {
     })
     // wrapper 按块起点归属；终点取末行起点，文末临时段落不属于表格。
     wrappers.push(BlockWrapper.create({ tagName: 'div', attributes: { class: `cm-md-table-widget ${classes.join(' ')}`, 'data-table-from': String(node.from), role: 'table' } }).range(first, state.doc.lineAt(node.to).from))
-  })
+  }
   return BlockWrapper.set(wrappers, true)
 }
 
@@ -339,19 +350,28 @@ function decorateRow(state: EditorState, row: TableRow, rowIndex: number, align:
   }
 }
 
-function tableDecorations(state: EditorState) {
+function tableDecorations(state: EditorState, nodes = tableNodes(state)) {
   const ranges: DecorationRange[] = []
   const prefixes: Range<Decoration>[] = []
-  eachTable(state, node => {
+  nodes.forEach(node => {
     const table = readTable(state, node)
     table.rows.forEach((row, index) => decorateRow(state, row, index, table.align, index === table.rows.length - 1, ranges, prefixes))
     const delimiter = state.doc.lineAt(table.delimiter.from)
     ranges.push({ from: delimiter.from, to: delimiter.from, deco: Decoration.line({ class: 'cm-md-table-delimiter' }) })
   })
-  return { decorations: Decoration.set(ranges.map(range => range.deco.range(range.from, range.to)), true), prefixes: Decoration.set(prefixes, true), wrappers: tableWrappers(state) }
+  return { decorations: Decoration.set(ranges.map(range => range.deco.range(range.from, range.to)), true), prefixes: Decoration.set(prefixes, true), wrappers: tableWrappers(state, nodes), tables: nodes.map(({ from, to }) => ({ from, to })) }
 }
 
-/** 只优化同一数据行里的普通文字编辑；结构变化和解析推进仍完整重建。 */
+function rowNodeAt(state: EditorState, pos: number): SyntaxNode | null {
+  for (const side of [1, -1] as const) {
+    let node: SyntaxNode | null = syntaxTree(state).resolveInner(pos, side)
+    while (node && node.name !== 'TableRow' && node.name !== 'TableHeader' && node.name !== 'Table') node = node.parent
+    if (node?.name === 'TableRow' || node?.name === 'TableHeader') return node
+  }
+  return null
+}
+
+/** 表头和数据行的文字编辑只重画当前行，不读取整张表。 */
 function changedTableRow(tr: Transaction): { before: SyntaxNode; after: SyntaxNode } | null {
   const edits: { from: number; to: number; next: number; plain: boolean }[] = []
   tr.changes.iterChanges((from, to, next, _end, inserted) => {
@@ -359,12 +379,7 @@ function changedTableRow(tr: Transaction): { before: SyntaxNode; after: SyntaxNo
   })
   if (edits.length !== 1 || !edits[0].plain) return null
   const { from, to, next } = edits[0]
-  const rowAt = (state: EditorState, pos: number) => {
-    let node: SyntaxNode | null = syntaxTree(state).resolveInner(pos, 1)
-    while (node && node.name !== 'TableRow' && node.name !== 'Table') node = node.parent
-    return node?.name === 'TableRow' ? node : null
-  }
-  const before = rowAt(tr.startState, from), after = rowAt(tr.state, next)
+  const before = rowNodeAt(tr.startState, from), after = rowNodeAt(tr.state, next)
   if (!before || !after || to > before.to || from < before.from || next < after.from) return null
   if (tr.changes.mapPos(before.parent!.from) !== after.parent!.from || tr.changes.mapPos(before.parent!.to) !== after.parent!.to) return null
   return { before, after }
@@ -373,25 +388,55 @@ function changedTableRow(tr: Transaction): { before: SyntaxNode; after: SyntaxNo
 const tableField = StateField.define<ReturnType<typeof tableDecorations>>({
   create: tableDecorations,
   update(value, tr) {
+    const tables = value.tables.map(table => ({ from: tr.changes.mapPos(table.from, -1), to: tr.changes.mapPos(table.to, 1) }))
+    const mapped = { decorations: value.decorations.map(tr.changes), prefixes: value.prefixes.map(tr.changes),
+      wrappers: tr.docChanged ? tableWrappers(tr.state, tables) : value.wrappers, tables }
+    if (tr.state.field(tableComposition, false)) return mapped
     if (tr.startState.facet(EditorView.editable) !== tr.state.facet(EditorView.editable) || tr.startState.readOnly !== tr.state.readOnly) return tableDecorations(tr.state)
-    if (!tr.docChanged) return syntaxTree(tr.startState) !== syntaxTree(tr.state) ? tableDecorations(tr.state) : value
-    const changed = changedTableRow(tr)
-    if (!changed) return tableDecorations(tr.state)
-    const from = tr.state.doc.lineAt(changed.after.from).from, to = changed.after.to
-    const ranges: DecorationRange[] = [], prefixes: Range<Decoration>[] = []
-    let index = 0
-    const previous = tr.startState.doc.lineAt(changed.before.from).from
-    value.decorations.between(previous, previous, (_from, _to, deco) => {
-      if (deco.spec.attributes?.['data-table-row']) index = Number(deco.spec.attributes['data-table-row'])
-    })
-    const table = readTable(tr.startState, changed.before.parent!)
-    decorateRow(tr.state, readRow(tr.state, changed.after), index, table.align, index === table.rows.length - 1, ranges, prefixes)
-    const filter = (start: number) => start < from || start > to
-    return {
-      decorations: value.decorations.map(tr.changes).update({ filterFrom: from, filterTo: to, filter, add: ranges.map(range => range.deco.range(range.from, range.to)), sort: true }),
-      prefixes: value.prefixes.map(tr.changes).update({ filterFrom: from, filterTo: to, filter, add: prefixes, sort: true }),
-      wrappers: tableWrappers(tr.state),
+    const compositionEnded = tr.effects.some(effect => effect.is(setTableComposition) && !effect.value)
+    const composition = tr.startState.field(tableComposition, false)
+    const composedAt = composition?.changes.mapPos(composition.start.selection.main.head)
+    if (!tr.docChanged && !compositionEnded && syntaxTree(tr.startState) === syntaxTree(tr.state)) return value
+    const changed = tr.docChanged && !compositionEnded ? changedTableRow(tr) : null
+    if (changed) {
+      const from = tr.state.doc.lineAt(changed.after.from).from, to = changed.after.to
+      const ranges: DecorationRange[] = [], prefixes: Range<Decoration>[] = []
+      let index = 0
+      const previous = tr.startState.doc.lineAt(changed.before.from).from
+      value.decorations.between(previous, previous, (_from, _to, deco) => {
+        if (deco.spec.attributes?.['data-table-row']) index = Number(deco.spec.attributes['data-table-row'])
+      })
+      const delimiter = changed.after.parent!.getChild('TableDelimiter')!
+      const align = rowAlignment(tr.state, readRow(tr.state, delimiter))
+      const last = !changed.after.nextSibling || (changed.after.nextSibling.name === 'TableDelimiter' && !changed.after.nextSibling.nextSibling)
+      decorateRow(tr.state, readRow(tr.state, changed.after), index, align, last, ranges, prefixes)
+      const filter = (start: number) => start < from || start > to
+      return { ...mapped,
+        decorations: mapped.decorations.update({ filterFrom: from, filterTo: to, filter, add: ranges.map(range => range.deco.range(range.from, range.to)), sort: true }),
+        prefixes: mapped.prefixes.update({ filterFrom: from, filterTo: to, filter, add: prefixes, sort: true }),
+      }
     }
+    // 只枚举容器下的表格边界；旧表消失、新表形成、后台解析推进都按范围差异更新。
+    const nodes = tableNodes(tr.state)
+    const oldByRange = new Map(tables.map((table, index) => [`${table.from}:${table.to}`, index]))
+    const retained = new Set<number>()
+    const rebuild = nodes.filter(node => {
+      const index = oldByRange.get(`${node.from}:${node.to}`)
+      if (index === undefined) return true
+      const old = value.tables[index]
+      if ((compositionEnded && composedAt !== undefined && composedAt >= old.from && composedAt <= old.to) || tr.changes.touchesRange(tr.startState.doc.lineAt(old.from).from, old.to)) return true
+      retained.add(index)
+      return false
+    })
+    const removed = tables.filter((_table, index) => !retained.has(index))
+    if (!rebuild.length && !removed.length) return mapped
+    const replacement = tableDecorations(tr.state, rebuild)
+    const affected = [...removed, ...rebuild].map(table => ({ from: tr.state.doc.lineAt(table.from).from, to: table.to }))
+    const filter = (from: number, to: number) => !affected.some(table => from <= table.to && to >= table.from)
+    const add = (set: DecorationSet) => { const ranges: Range<Decoration>[] = []; set.between(0, tr.state.doc.length, (from, to, deco) => { ranges.push(deco.range(from, to)) }); return ranges }
+    return { decorations: mapped.decorations.update({ filter, add: add(replacement.decorations), sort: true }),
+      prefixes: mapped.prefixes.update({ filter, add: add(replacement.prefixes), sort: true }),
+      wrappers: tableWrappers(tr.state, nodes), tables: nodes.map(({ from, to }) => ({ from, to })) }
   },
   // 表格前缀的坐标优先于通用的引用、列表标记隐藏规则；单元格仍包在行内装饰外面
   provide: field => [EditorView.outerDecorations.from(field, value => value.decorations), Prec.high(EditorView.decorations.from(field, value => value.prefixes)), EditorView.blockWrappers.from(field, value => value.wrappers)],
@@ -412,7 +457,7 @@ function tableLayoutSnapshot(table: MarkdownTable, layout: TableLayout): TableLa
 }
 
 const tableLayout = ViewPlugin.fromClass(class {
-  private readonly id = String(++tableLayoutId)
+  readonly id = String(++tableLayoutId)
   private readonly style = document.createElement('style')
   private readonly measure = document.createElement('div')
   private readonly canvas = document.createElement('canvas').getContext('2d')!
@@ -423,7 +468,6 @@ const tableLayout = ViewPlugin.fromClass(class {
   private signature = ''
 
   constructor(private readonly view: EditorView) {
-    view.dom.dataset.tableLayout = this.id
     this.measure.className = 'cm-content'
     this.measure.style.cssText = 'position:fixed;left:-100000px;top:0;visibility:hidden;pointer-events:none;width:max-content;max-width:none;padding:0'
     this.measure.setAttribute('aria-hidden', 'true')
@@ -434,14 +478,33 @@ const tableLayout = ViewPlugin.fromClass(class {
   update(update: ViewUpdate): void {
     const reconfigured = update.transactions.some(tr => tr.reconfigured && !tr.annotation(tableGeometryUpdate))
     if (reconfigured) this.signature = ''
+    if (update.state.field(tableComposition, false)) return
     if (update.docChanged) {
+      const localRows = update.transactions.every(tr => !tr.docChanged || !!changedTableRow(tr))
+      let numericChanged = false
+      if (localRows) for (const tr of update.transactions) tr.changes.iterChanges((from, to, next, end) => {
+        const before = cellAround(tr.startState, from, to), after = cellAround(tr.state, next, end)
+        if ([before && tr.startState.sliceDoc(before.start, before.end), after && tr.state.sliceDoc(after.start, after.end)].some(text => text && NUMERIC.test(text))) numericChanged = true
+      })
       // 格内编辑只改变文字，沿用列宽；否则少一个字也会重分配整张表，把光标横向推走。
       // 映射各格的边界，只有格线、行列和对齐都没变时才保留布局。
       const retained = new Map<number, TableLayoutSnapshot>()
+      const rules = new Map<number, string>()
+      const retainRule = (from: number, mapped: number) => {
+        const css = this.rules.get(from)
+        if (css) rules.set(mapped, css.replaceAll(`[data-table-from="${from}"]`, `[data-table-from="${mapped}"]`))
+      }
       for (const [from, layout] of this.layouts) {
         const mapped = update.changes.mapPos(from, -1)
         if (!update.changes.touchesRange(from, from + layout.length)) {
           retained.set(mapped, layout)
+          retainRule(from, mapped)
+          continue
+        }
+        if (localRows) {
+          retained.set(mapped, { ...layout, length: update.changes.mapPos(from + layout.length, -1) - mapped,
+            boundaries: layout.boundaries.map((pos, index) => update.changes.mapPos(from + pos, index % 2 ? 1 : -1) - mapped) })
+          if (!numericChanged) retainRule(from, mapped)
           continue
         }
         const next = tableAt(update.state, mapped)
@@ -457,6 +520,7 @@ const tableLayout = ViewPlugin.fromClass(class {
       }
       this.layouts = retained
       this.rules.clear()
+      for (const [from, css] of rules) this.rules.set(from, css)
     }
     if (reconfigured || update.docChanged || update.viewportChanged || update.geometryChanged) this.schedule()
   }
@@ -507,24 +571,27 @@ const tableLayout = ViewPlugin.fromClass(class {
         this.rules.clear()
       }
       const pending = new Map<string, { cell: TableCell; header: boolean; font: string }>()
-      const tables = new Map<MarkdownTable, number>()
+      const tables = new Map<number, number>()
       view.contentDOM.querySelectorAll<HTMLElement>('.cm-md-table-row').forEach(row => {
-        const table = tableAt(view.state, Number(row.closest<HTMLElement>('.cm-md-table-widget')!.dataset.tableFrom))
-        if (!table || tables.has(table)) return
         const wrapper = row.closest<HTMLElement>('.cm-md-table-widget')!
+        const from = Number(wrapper.dataset.tableFrom)
+        if (tables.has(from)) return
         const wrapperStyle = getComputedStyle(wrapper)
         const parent = wrapper.parentElement!
         const parentStyle = getComputedStyle(parent)
         // 新数字还没放开换行时会暂时撑宽 table，不能把溢出后的宽度当作可用空间。
         const available = parent.clientWidth - parseFloat(parentStyle.paddingLeft) - parseFloat(parentStyle.paddingRight)
           - parseFloat(wrapperStyle.borderLeftWidth) - parseFloat(wrapperStyle.borderRightWidth)
-        tables.set(table, Math.min(wrapper.clientWidth, available) - parseFloat(wrapperStyle.paddingLeft) - parseFloat(wrapperStyle.paddingRight))
+        tables.set(from, Math.min(wrapper.clientWidth, available) - parseFloat(wrapperStyle.paddingLeft) - parseFloat(wrapperStyle.paddingRight))
       })
       const layouts: (TableLayout & { table: MarkdownTable })[] = []
       // 列宽快照和规则属于当前文档；仅内容度量随视口释放，不保留旧语法表对象。
       const usedMetrics = new Set<string>()
-      for (const [table, width] of tables) {
-        let cached = this.layouts.get(table.from)
+      for (const [from, width] of tables) {
+        let cached = this.layouts.get(from)
+        if (cached?.width === width && this.rules.has(from)) continue
+        const table = tableAt(view.state, from)
+        if (!table) continue
         if (cached && (cached.length !== table.to - table.from || !this.rules.has(table.from))) {
           const current = tableLayoutSnapshot(table, cached)
           const boundaries = cached.boundaries
@@ -630,9 +697,8 @@ const tableLayout = ViewPlugin.fromClass(class {
   destroy(): void {
     this.style.remove()
     this.measure.remove()
-    delete this.view.dom.dataset.tableLayout
   }
-})
+}, { provide: plugin => EditorView.contentAttributes.of(view => ({ 'data-table-layout': view.plugin(plugin)?.id ?? '' })) })
 
 function tableAt(state: EditorState, pos: number): MarkdownTable | null {
   let node: SyntaxNode | null = syntaxTree(state).resolveInner(pos, -1)
@@ -787,17 +853,29 @@ function returnFromParagraph(view: EditorView, direction: number): boolean {
 
 function currentCell(state: EditorState) {
   if (pendingParagraph(state)) return null
-  const table = tableAt(state, state.selection.main.head)
+  const head = state.selection.main.head
+  const node = rowNodeAt(state, head)
+  if (node) {
+    const target = readRow(state, node)
+    const columns = readRow(state, node.parent!.getChild('TableDelimiter')!).cells.length
+    const hint = state.field(virtualCell, false)
+    const found = target.cells.findIndex(cell => head < cell.to || head === cell.end)
+    const column = hint?.row === target.from ? hint.column
+      : Math.min(columns - 1, found >= 0 ? found : target.trailing ? target.cells.length : target.cells.length - 1)
+    return { get table() { return readTable(state, node.parent!) },
+      get row() { return this.table.rows.findIndex(row => row.from === target.from) },
+      column, cell: target.cells[column], target }
+  }
+  const table = tableAt(state, head)
   if (!table) return null
-  let row = table.rows.findIndex(row => state.selection.main.head <= row.to)
+  let row = table.rows.findIndex(row => head <= row.to)
   if (row < 0) row = table.rows.length - 1
-  const cells = table.rows[row].cells
+  const target = table.rows[row]
   const hint = state.field(virtualCell, false)
-  const found = cells.findIndex(cell => state.selection.main.head < cell.to || state.selection.main.head === cell.end)
-  // 行尾竖线之后的位置属于下一格：源码里在这里输入就是补出下一格
-  const column = hint?.row === table.rows[row].from ? hint.column
-    : Math.min(table.align.length - 1, found >= 0 ? found : table.rows[row].trailing ? cells.length : cells.length - 1)
-  return { table, row, column, cell: cells[column] }
+  const found = target.cells.findIndex(cell => head < cell.to || head === cell.end)
+  const column = hint?.row === target.from ? hint.column
+    : Math.min(table.align.length - 1, found >= 0 ? found : target.trailing ? target.cells.length : target.cells.length - 1)
+  return { table, row, column, cell: target.cells[column], target }
 }
 
 // 光标贴住所在的格：紧凑表格 `|xy|zw|` 的格尾就是右侧竖线的位置，空格子的位置也常与下一格
@@ -1018,7 +1096,8 @@ function rowSuffix(values: string[], trailing: boolean): { text: string; pipes: 
  * 只有分格会变时，才把该行各格中原本没配对的反引号转义；完整代码与未编辑行不动。
  */
 function preserveTableRows(state: EditorState, changes: TextChange[], rows: Set<number>, insertedPipes = new Map<TextChange, number[]>()): TextChange[] {
-  const result = [...changes]
+  const replaced = new Set<TextChange>()
+  const repairs: TextChange[] = []
   const grouped = new Map<number, TextChange[]>()
   for (const change of changes) {
     const line = state.doc.lineAt(change.from)
@@ -1048,10 +1127,10 @@ function preserveTableRows(state: EditorState, changes: TextChange[], rows: Set<
     const escapes = positions.map(pos => ({ from: nextFrom + pos, to: nextFrom + pos, insert: '\\' }))
     // 组合源码改动而不把整行变成一次替换，光标与多选区仍能精确映射。
     const repaired = set.compose(ChangeSet.of(escapes, set.newLength))
-    for (const edit of edits) result.splice(result.indexOf(edit), 1)
-    repaired.iterChanges((from, to, _fromB, _toB, inserted) => result.push({ from, to, insert: inserted.toString() }))
+    for (const edit of edits) replaced.add(edit)
+    repaired.iterChanges((from, to, _fromB, _toB, inserted) => repairs.push({ from, to, insert: inserted.toString() }))
   }
-  return result.sort((a, b) => a.from - b.from)
+  return [...changes.filter(change => !replaced.has(change)), ...repairs].sort((a, b) => a.from - b.from)
 }
 
 export interface TextMatch { from: number; to: number }
@@ -1163,22 +1242,25 @@ function withinCell(cell: TableCell | undefined, from: number, to: number): bool
 
 /** [from, to] 整个落在哪一格的竖线之间 */
 function cellAround(state: EditorState, from: number, to: number): TableCell | undefined {
-  const table = tableAt(state, from)
-  const row = table?.rows.find(row => from >= row.from && to <= row.to)
-  return row?.cells.slice(0, table!.align.length).find(cell => withinCell(cell, from, to))
+  const node = rowNodeAt(state, from)
+  if (!node || to > node.to) return undefined
+  const columns = readRow(state, node.parent!.getChild('TableDelimiter')!).cells.length
+  return readRow(state, node).cells.slice(0, columns).find(cell => withinCell(cell, from, to))
 }
 
 function insertCellText(view: EditorView, from: number, to: number, text: string): boolean {
   const current = currentCell(view.state)
   if (!current || !view.state.facet(EditorView.editable) || view.state.readOnly) return false
-  const { table, row, column, cell } = current
+  const { cell } = current
   if (cell) {
     if (!withinCell(cell, from, to)) return false
     if (cell.start === cell.end && cell.left < cell.right) {
       // 只有空格的格子：写成 `| 内容 |`，不把字贴在右边的竖线上
       const value = cellText(text)
       const insert = ` ${value}${view.state.sliceDoc(cell.right, cell.right + 1) === '|' ? ' ' : ''}`
-      view.dispatch({ changes: { from: cell.left, to: cell.right, insert }, selection: EditorSelection.create([EditorSelection.cursor(cell.left + 1 + value.length, -1)]), annotations: tableEdit.of(true), userEvent: 'input.type' })
+      const changes = preserveTableRows(view.state, [{ from: cell.left, to: cell.right, insert }], new Set([view.state.doc.lineAt(cell.left).from]))
+      const anchor = view.state.changes(changes).mapPos(cell.right, 1) - (insert.endsWith(' ') ? 1 : 0)
+      view.dispatch({ changes, selection: EditorSelection.create([EditorSelection.cursor(anchor, -1)]), annotations: tableEdit.of(true), userEvent: 'input.type' })
       return true
     }
     const change = cellChange(view.state, cell, from, to, text)
@@ -1188,10 +1270,13 @@ function insertCellText(view: EditorView, from: number, to: number, text: string
     const anchor = view.state.changes(changes).mapPos(to, 1)
     view.dispatch({ changes, selection: EditorSelection.create([EditorSelection.cursor(anchor, -1)]), annotations: tableEdit.of(true), userEvent: 'input.type' })
   } else {
+    const { table, row, column } = current
     const target = table.rows[row]
-    const trailing = target.trailing
     const values = Array.from({ length: table.align.length - target.cells.length }, (_, i) => i + target.cells.length === column ? cellText(text) : '')
-    editTable(view, table, { from: target.to, insert: `${trailing ? '' : ' |'} ${values.join(' | ')} |` }, row, column)
+    const suffix = rowSuffix(values, target.trailing)
+    const change = { from: target.to, to: target.to, insert: suffix.text }
+    const changes = preserveTableRows(view.state, [change], new Set([view.state.doc.lineAt(target.from).from]), new Map([[change, suffix.pipes]]))
+    editTable(view, table, changes, row, column)
   }
   return true
 }
@@ -1215,21 +1300,27 @@ function deleteToCellEdge(view: EditorView, direction: number): boolean {
   return true
 }
 
-function moveAcrossCell(view: EditorView, direction: number): boolean {
+function moveAcrossCell(view: EditorView, direction: number, extend = false): boolean {
   if (returnFromParagraph(view, direction)) return true
   const current = currentCell(view.state)
-  if (!current || !view.state.selection.main.empty) return false
+  if (!current || (!extend && !view.state.selection.main.empty)) return false
+  const range = view.state.selection.main
   const { table, row, column, cell } = current
   if (cell && (direction < 0 ? view.state.selection.main.head > cell.start : view.state.selection.main.head < cell.end)) return false
   const index = row * table.align.length + column + direction
   if (index < 0 || index >= table.rows.length * table.align.length) {
-    leaveTable(view, table, direction)
+    if (extend) {
+      const pos = direction < 0 ? Math.max(0, view.state.doc.lineAt(table.from).from - 1) : Math.min(view.state.doc.length, table.to + 1)
+      view.dispatch({ selection: { anchor: range.anchor, head: pos }, scrollIntoView: true })
+    } else leaveTable(view, table, direction)
   } else {
     const r = Math.floor(index / table.align.length)
     const c = index % table.align.length
     const target = table.rows[r].cells[c]
-    if (!target || target.start === target.end) selectCell(view, table, r, c, false)
-    else view.dispatch({ selection: EditorSelection.create([EditorSelection.cursor(direction < 0 ? target.end : target.start, direction)]), scrollIntoView: true })
+    const pos = target ? direction < 0 ? target.end : target.start : table.rows[r].to
+    if (extend) view.dispatch({ selection: { anchor: range.anchor, head: pos }, scrollIntoView: true })
+    else if (!target || target.start === target.end) selectCell(view, table, r, c, false)
+    else view.dispatch({ selection: EditorSelection.create([EditorSelection.cursor(pos, direction)]), scrollIntoView: true })
   }
   return true
 }
@@ -1298,7 +1389,54 @@ function moveVertical(view: EditorView, direction: 1 | -1, extend = false): bool
   return true
 }
 
+const setTableComposition = StateEffect.define<boolean>()
+const tableComposition = StateField.define<{ start: EditorState; changes: ChangeSet } | null>({
+  create: () => null,
+  update(value, tr) {
+    for (const effect of tr.effects) if (effect.is(setTableComposition)) return effect.value ? { start: tr.startState, changes: tr.startState.changes([]) } : null
+    return value && tr.docChanged ? { start: value.start, changes: value.changes.compose(tr.changes) } : value
+  },
+})
+
+const tableCompositionInput = ViewPlugin.fromClass(class {
+  timer: ReturnType<typeof setTimeout> | undefined
+  constructor(readonly view: EditorView) {}
+  finish(): void {
+    const { view } = this
+    const composition = view.state.field(tableComposition)
+    if (!composition) return
+    const changes: TextChange[] = [], rows = new Set<number>()
+    composition.changes.iterChanges((from, to, _fromB, _toB, inserted) => {
+      const cell = cellAround(composition.start, from, to)
+      if (cell) rows.add(composition.start.doc.lineAt(cell.left).from)
+      const change = cell ? cellChange(composition.start, cell, from, to, inserted.toString()) : { from, to, insert: inserted.toString() }
+      if (change) changes.push(change)
+    })
+    const safe = composition.start.changes(preserveTableRows(composition.start, changes, rows))
+    const repair = composition.changes.invert(composition.start.doc).compose(safe)
+    view.dispatch({ changes: repair, selection: view.state.selection.map(repair), effects: setTableComposition.of(false), annotations: tableEdit.of(true), userEvent: 'input.type.compose' })
+  }
+  destroy(): void { clearTimeout(this.timer) }
+  end(): void {
+    clearTimeout(this.timer)
+    // 等 CM 读完最后一次 DOM 变动，不在组字过程中重建节点。
+    this.timer = setTimeout(() => this.finish(), 20)
+  }
+}, {
+  eventHandlers: {
+    compositionstart(event) {
+      if (!(event.target instanceof HTMLElement) || event.target.closest('.cm-md-table-input') || !cellAround(this.view.state, this.view.state.selection.main.from, this.view.state.selection.main.to)) return
+      clearTimeout(this.timer)
+      this.finish()
+      this.view.dispatch({ effects: setTableComposition.of(true) })
+    },
+    compositionend() { this.end() },
+  },
+})
+
 export const tableEditing = [
+  tableComposition,
+  tableCompositionInput,
   virtualCell,
   tableParagraph,
   tableParagraphHistory,
@@ -1308,14 +1446,14 @@ export const tableEditing = [
   tableGeometry.of([]),
   tableLayout,
   EditorState.transactionFilter.of(tr => {
-    if (!tr.selection || tr.isUserEvent('input.type.compose') || tr.effects.some(effect => effect.is(setVirtualCell))) return tr
+    if (!tr.selection || tr.state.field(tableComposition, false) || tr.isUserEvent('input.type.compose') || tr.effects.some(effect => effect.is(setVirtualCell))) return tr
     const range = tr.newSelection.main
     const current = currentCell(tr.state)
     if (!current) return tr
-    const { table, row, cell } = current
+    const { target, cell } = current
     let head = range.head
     if (!tr.docChanged) {
-      if (range.empty) head = cell ? Math.max(cell.start, Math.min(cell.end, head)) : table.rows[row].to
+      if (range.empty) head = cell ? Math.max(cell.start, Math.min(cell.end, head)) : target.to
       // 隐藏的转义符和它后面的字之间看不出位置：向右移一个字时越过这一对，其余落在它前面
       if (cell && hiddenEscapes(tr.state, cell).includes(head - 1)) {
         head += !tr.isUserEvent('select.pointer') && tr.startState.selection.main.head === head - 1 ? 1 : -1
@@ -1327,8 +1465,11 @@ export const tableEditing = [
     return [tr, { selection: tr.newSelection.replaceRange(next), sequential: true }]
   }),
   EditorState.changeFilter.of(tr => {
-    if (!isCellEdit(tr)) return true
+    if (!isCellEdit(tr) || tr.startState.field(tableComposition, false)) return true
     if (tr.annotation(tableEdit)) return true
+    let inside = true
+    tr.changes.iterChangedRanges((from, to) => { if (!cellAround(tr.startState, from, to)) inside = false })
+    if (inside) return true
     const table = tableAt(tr.startState, tr.startState.selection.main.head)
     if (!table) return true
     const selection = tr.startState.selection.main
@@ -1360,7 +1501,7 @@ export const tableEditing = [
   }),
   // 删除、剪切、拖放和多光标编辑不经过 insertCellText，同样按看到的字改原文。组合输入期间不动，免得打断输入法
   EditorState.transactionFilter.of(tr => {
-    if (!tr.docChanged || tr.annotation(tableEdit) || tr.isUserEvent('input.type.compose') || !isCellEdit(tr)) return tr
+    if (!tr.docChanged || tr.annotation(tableEdit) || tr.startState.field(tableComposition, false) || tr.isUserEvent('input.type.compose') || !isCellEdit(tr)) return tr
     const changes: { from: number; to: number; insert: string }[] = []
     let rewritten = false
     let rejected = false
@@ -1397,7 +1538,7 @@ export const tableEditing = [
       scrollIntoView: tr.scrollIntoView,
     }
   }),
-  Prec.high(keymap.of([
+  Prec.highest(keymap.of([
     { key: 'Tab', run: view => navigate(view, 1) },
     { key: 'Shift-Tab', run: view => navigate(view, -1) },
     { key: 'Enter', run: view => navigate(view, 1, true) },
@@ -1417,6 +1558,8 @@ export const tableEditing = [
     { mac: 'Mod-Delete', run: view => deleteToCellEdge(view, 1) },
     { key: 'ArrowLeft', run: view => moveAcrossCell(view, -1) },
     { key: 'ArrowRight', run: view => moveAcrossCell(view, 1) },
+    { key: 'Shift-ArrowLeft', run: view => moveAcrossCell(view, -1, true) },
+    { key: 'Shift-ArrowRight', run: view => moveAcrossCell(view, 1, true) },
     { key: 'ArrowUp', run: view => moveVertical(view, -1) },
     { key: 'ArrowDown', run: view => moveVertical(view, 1) },
     { key: 'Shift-ArrowUp', run: view => moveVertical(view, -1, true) },
@@ -1506,8 +1649,9 @@ export const tableEditing = [
       const protectedRows = new Set<number>()
       const insertedPipes = new Map<TextChange, number[]>()
       const rows = [...table.rows, table.delimiter]
-      for (const target of rows) {
-        const index = table.rows.indexOf(target)
+      for (let r = 0; r < rows.length; r++) {
+        const target = rows[r]
+        const index = r === table.rows.length ? -1 : r
         for (let c = 0; c < Math.min(target.cells.length, columns); c++) {
           const value = values[index - row]?.[c - column]
           if (index >= row && c >= column && value !== undefined) {
