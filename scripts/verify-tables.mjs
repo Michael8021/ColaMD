@@ -163,6 +163,59 @@ try {
         check(`输入法提交 ${JSON.stringify(text)} 一步撤销`, await doc() === original, await doc())
       }
     },
+    async imeLifecycle() {
+      const original = '| A | B |\n|---|---|\n| x | y |\n'
+      const compose = async text => {
+        await sleep(40)
+        await send('Input.imeSetComposition', { text, selectionStart: text.length, selectionEnd: text.length })
+        await send('Input.insertText', { text })
+      }
+      for (const next of ['Enter', 'Tab', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', '普通键', '连续组字']) {
+        await setDoc(original)
+        await select('x')
+        await compose('甲|乙')
+        check(`组字提交在 ${next} 前已保护格线`, await doc() === original.replace('x', '甲\\|乙x'), await doc())
+        if (next === '连续组字') {
+          await compose('丙|丁')
+          check('连续组字分别保护且不遗留快照', await doc() === original.replace('x', '甲\\|乙丙\\|丁x'), await doc())
+        } else if (next === '普通键') {
+          await send('Input.insertText', { text: 'Z' })
+          check('组字后立即普通输入留在同格', await doc() === original.replace('x', '甲\\|乙Zx'), await doc())
+        } else {
+          await key(next)
+          check(`组字后立即 ${next} 保留提交并正常导航`, await doc() === original.replace('x', '甲\\|乙x') + (next === 'Enter' ? '|  |  |\n' : ''), await doc())
+        }
+      }
+      await setDoc(original)
+      await select('x')
+      await sleep(40)
+      await send('Input.imeSetComposition', { text: '取消', selectionStart: 2, selectionEnd: 2 })
+      await send('Input.imeSetComposition', { text: '', selectionStart: 0, selectionEnd: 0 })
+      check('取消组字保留原文字节', await doc() === original, await doc())
+      await send('Input.insertText', { text: 'Z' })
+      check('取消组字后下一次输入正常', await doc() === original.replace('x', 'Zx'), await doc())
+      for (const mode of ['源码', '标签']) {
+        await setDoc(original)
+        await select('x')
+        await sleep(40)
+        await send('Input.imeSetComposition', { text: '甲|乙', selectionStart: 3, selectionEnd: 3 })
+        await evaluate(`document.querySelector(${JSON.stringify(mode === '源码' ? '#source-toggle-btn' : '.tab-new-btn')}).click()`)
+        if (mode === '源码') {
+          check('组字期间切源码先保护当前文字', await evaluate(`document.getElementById('source-editor').value`) === original.replace('x', '甲\\|乙x'))
+          await evaluate(`document.getElementById('source-toggle-btn').click()`)
+        } else {
+          for (let i = 0; i < 50 && await doc() !== ''; i++) await sleep(20)
+          check('组字期间切标签不把文字带入新标签', await doc() === '')
+          await evaluate(`document.querySelector('.tab-entry').click()`)
+        }
+        await sleep(100)
+        check(`组字期间切${mode}往返保留原文`, await doc() === original.replace('x', '甲\\|乙x'), await doc())
+        await select('x')
+        await sleep(40)
+        await send('Input.insertText', { text: 'Z' })
+        check(`组字期间切${mode}后可继续输入`, await doc() === original.replace('x', '甲\\|乙Zx'), await doc())
+      }
+    },
     async imeLayout() {
       const original = '| A | B |\n|---|---|\n| 1 | label |\n'
       const digits = '1234567890'.repeat(14)
@@ -234,13 +287,27 @@ try {
       await key('z', MOD)
       check('大批 TSV 整体一步撤销', await doc() === original)
     },
+    async singleState() {
+      await setDoc('| A | B |\n|---|---|\n| value | label |\n')
+      await evaluate(`(() => {
+        window.docStateBuilds = 0;
+        v.dispatch({effects:v.scrollSnapshot().constructor.appendConfig.of(v.constructor.contentAttributes.compute(['doc'], () => { docStateBuilds++; return {} }))});
+      })()`)
+      for (const [name, removed, inserted] of [['格尾插入', 0, 'X'], ['格尾退格', 1, ''], ['格中删除', 1, ''], ['格内粘贴', 0, 'paste']]) {
+        await setDoc('| A | B |\n|---|---|\n| value | label |\n')
+        await select('value', name === '格中删除' ? 3 : 5)
+        await evaluate('docStateBuilds = 0')
+        await evaluate(`(() => {const h=v.state.selection.main.head;v.dispatch({changes:{from:h-${removed},to:h,insert:${JSON.stringify(inserted)}},selection:{anchor:h-${removed}+${inserted.length}},userEvent:${JSON.stringify(name === '格内粘贴' ? 'input.paste' : removed ? 'delete.backward' : 'input.type')}})})()`)
+        check(`${name} 调整光标只构造一次文档状态`, await evaluate('docStateBuilds') === 1, String(await evaluate('docStateBuilds')))
+      }
+    },
     async incremental() {
       const original = '正文。\n\n| A | B |\n|---|---|\n' + '| item | value |\n'.repeat(600)
       for (const target of ['正文', 'A', 'item']) {
         await setDoc(original)
         await select(target, 1)
         await evaluate(`(() => {
-          window.tableDecoRefs = v.state.facet(v.constructor.outerDecorations).filter(set => set.between).flatMap(set => {
+          window.tableDecoRefs = v.state.facet(v.constructor.outerDecorations).map(set => typeof set === 'function' ? set(v) : set).filter(set => set.between).flatMap(set => {
             const refs = []; set.between(v.state.doc.length - 30, v.state.doc.length - 1, (_from,_to,deco) => { if(deco.spec.class?.includes('cm-md-table')) refs.push(deco) }); return refs;
           });
           window.slicedCharacters = 0; window.tableSlicedCharacters = 0; window.textPrototype = Object.getPrototypeOf(v.state.doc); window.originalSlice = textPrototype.sliceString;
@@ -249,7 +316,7 @@ try {
         try {
           await evaluate(`(() => {const h=v.state.selection.main.head;v.dispatch({changes:{from:h,insert:'X'},selection:{anchor:h+1},userEvent:'input.type'})})()`)
         } finally { await evaluate('textPrototype.sliceString = originalSlice') }
-        const refs = await evaluate(`(() => {const refs = v.state.facet(v.constructor.outerDecorations).filter(set => set.between).flatMap(set => {const found=[];set.between(v.state.doc.length-30,v.state.doc.length-1,(_from,_to,deco)=>{if(deco.spec.class?.includes('cm-md-table'))found.push(deco)});return found});return {total:tableDecoRefs.length,reused:tableDecoRefs.filter(deco=>refs.includes(deco)).length,sliced:slicedCharacters, tableSliced:tableSlicedCharacters}})()`)
+        const refs = await evaluate(`(() => {const refs = v.state.facet(v.constructor.outerDecorations).map(set => typeof set === 'function' ? set(v) : set).filter(set => set.between).flatMap(set => {const found=[];set.between(v.state.doc.length-30,v.state.doc.length-1,(_from,_to,deco)=>{if(deco.spec.class?.includes('cm-md-table'))found.push(deco)});return found});return {total:tableDecoRefs.length,reused:tableDecoRefs.filter(deco=>refs.includes(deco)).length,sliced:slicedCharacters, tableSliced:tableSlicedCharacters}})()`)
         check(`${target} 编辑复用未改行装饰`, refs.total > 0 && refs.reused === refs.total, JSON.stringify(refs))
         check(`${target} 编辑不读取整张表的所有格子`, refs.tableSliced < original.length / 3, JSON.stringify(refs))
       }

@@ -21,6 +21,7 @@ import { runFormatCommand as runFormat, type FormatCommandId } from './format-co
 import { isChinese } from '../ui-language'
 import { headingAnchorLine } from './heading-anchor'
 import { isDiagramZoomed } from './mermaid-bridge'
+import { finishTableComposition } from './table-editing'
 
 // katex 的样式表仍要引，公式 widget 里渲出来的 HTML 靠它排版。
 import 'katex/dist/katex.min.css'
@@ -571,6 +572,12 @@ export function focusEditor(): void {
 // （renderer/slideshow.ts）；这是第二道锁，万一有键漏过来，也落不到没人看得见的页面上。
 export function setEditorEditable(editable: boolean): void {
   handle?.setEditable(editable)
+}
+
+// 在外壳保存标签或切换模式之前结束组字，仍由表格扩展负责保护原文。
+export function finishEditorComposition(): void {
+  const view = handle?.getView()
+  if (view) finishTableComposition(view)
 }
 
 // 多个标签共用一个编辑器实例。编辑器状态带着文档、选区和撤销栈，

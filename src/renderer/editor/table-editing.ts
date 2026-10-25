@@ -388,17 +388,18 @@ function changedTableRow(tr: Transaction): { before: SyntaxNode; after: SyntaxNo
 const tableField = StateField.define<ReturnType<typeof tableDecorations>>({
   create: tableDecorations,
   update(value, tr) {
+    const changed = tr.docChanged ? changedTableRow(tr) : null
     const tables = value.tables.map(table => ({ from: tr.changes.mapPos(table.from, -1), to: tr.changes.mapPos(table.to, 1) }))
     const mapped = { decorations: value.decorations.map(tr.changes), prefixes: value.prefixes.map(tr.changes),
-      wrappers: tr.docChanged ? tableWrappers(tr.state, tables) : value.wrappers, tables }
+      wrappers: tr.docChanged ? changed && tables.every((table, index) => table.from === value.tables[index].from)
+        ? value.wrappers.map(tr.changes) : tableWrappers(tr.state, tables) : value.wrappers, tables }
     if (tr.state.field(tableComposition, false)) return mapped
     if (tr.startState.facet(EditorView.editable) !== tr.state.facet(EditorView.editable) || tr.startState.readOnly !== tr.state.readOnly) return tableDecorations(tr.state)
     const compositionEnded = tr.effects.some(effect => effect.is(setTableComposition) && !effect.value)
     const composition = tr.startState.field(tableComposition, false)
     const composedAt = composition?.changes.mapPos(composition.start.selection.main.head)
     if (!tr.docChanged && !compositionEnded && syntaxTree(tr.startState) === syntaxTree(tr.state)) return value
-    const changed = tr.docChanged && !compositionEnded ? changedTableRow(tr) : null
-    if (changed) {
+    if (changed && !compositionEnded) {
       const from = tr.state.doc.lineAt(changed.after.from).from, to = changed.after.to
       const ranges: DecorationRange[] = [], prefixes: Range<Decoration>[] = []
       let index = 0
@@ -438,8 +439,9 @@ const tableField = StateField.define<ReturnType<typeof tableDecorations>>({
       prefixes: mapped.prefixes.update({ filter, add: add(replacement.prefixes), sort: true }),
       wrappers: tableWrappers(tr.state, nodes), tables: nodes.map(({ from, to }) => ({ from, to })) }
   },
-  // 表格前缀的坐标优先于通用的引用、列表标记隐藏规则；单元格仍包在行内装饰外面
-  provide: field => [EditorView.outerDecorations.from(field, value => value.decorations), Prec.high(EditorView.decorations.from(field, value => value.prefixes)), EditorView.blockWrappers.from(field, value => value.wrappers)],
+  // 格内替换不跨行，通过视图提供，避免高度树每键比较整表的行内替换。
+  // 表格前缀优先于引用、列表标记；单元格仍包在行内装饰外面。
+  provide: field => [EditorView.outerDecorations.of(view => view.state.field(field).decorations), Prec.high(EditorView.decorations.of(view => view.state.field(field).prefixes)), EditorView.blockWrappers.from(field, value => value.wrappers)],
 })
 
 let tableLayoutId = 0
@@ -1401,9 +1403,17 @@ const tableComposition = StateField.define<{ start: EditorState; changes: Change
 })
 
 const tableCompositionInput = ViewPlugin.fromClass(class {
-  timer: ReturnType<typeof setTimeout> | undefined
-  constructor(readonly view: EditorView) {}
+  ending = false
+  private queued = false
+  private destroyed = false
+  constructor(readonly view: EditorView) {
+    if (view.state.field(tableComposition, false)) this.end()
+  }
+  update(update: ViewUpdate): void {
+    if (this.ending && !update.view.compositionStarted) this.schedule()
+  }
   finish(): void {
+    this.ending = false
     const { view } = this
     const composition = view.state.field(tableComposition)
     if (!composition) return
@@ -1415,26 +1425,78 @@ const tableCompositionInput = ViewPlugin.fromClass(class {
       if (change) changes.push(change)
     })
     const safe = composition.start.changes(preserveTableRows(composition.start, changes, rows))
-    const repair = composition.changes.invert(composition.start.doc).compose(safe)
+    const repairs: TextChange[] = []
+    composition.changes.invert(composition.start.doc).compose(safe).iterChanges((from, to, _next, _end, inserted) => {
+      const before = view.state.sliceDoc(from, to), after = inserted.toString()
+      let start = 0, end = before.length, nextEnd = after.length
+      while (start < end && start < nextEnd && before[start] === after[start]) start++
+      while (end > start && nextEnd > start && before[end - 1] === after[nextEnd - 1]) { end--; nextEnd-- }
+      if (start < end || start < nextEnd) repairs.push({ from: from + start, to: from + end, insert: after.slice(start, nextEnd) })
+    })
+    // 只派发实际转义差异；整段先删后插会把组字末尾的光标映回开头。
+    const repair = view.state.changes(repairs)
     view.dispatch({ changes: repair, selection: view.state.selection.map(repair), effects: setTableComposition.of(false), annotations: tableEdit.of(true), userEvent: 'input.type.compose' })
   }
-  destroy(): void { clearTimeout(this.timer) }
+  destroy(): void { this.destroyed = true }
+  schedule(): void {
+    if (this.queued) return
+    this.queued = true
+    const start = this.view.state.field(tableComposition, false)?.start
+    // compositionend / input 所在任务的 DOM 变更先交给 MutationObserver 和 CM；
+    // 再离开 update 收口。两层微任务覆盖事件之后才入队的 DOM 观察器，不依赖帧或延时。
+    queueMicrotask(() => queueMicrotask(() => {
+      this.queued = false
+      if (!this.destroyed && this.ending && !this.view.compositionStarted &&
+        this.view.state.field(tableComposition, false)?.start === start) this.finish()
+    }))
+  }
   end(): void {
-    clearTimeout(this.timer)
-    // 等 CM 读完最后一次 DOM 变动，不在组字过程中重建节点。
-    this.timer = setTimeout(() => this.finish(), 20)
+    this.ending = true
+    this.schedule()
   }
 }, {
   eventHandlers: {
     compositionstart(event) {
       if (!(event.target instanceof HTMLElement) || event.target.closest('.cm-md-table-input') || !cellAround(this.view.state, this.view.state.selection.main.from, this.view.state.selection.main.to)) return
-      clearTimeout(this.timer)
       this.finish()
       this.view.dispatch({ effects: setTableComposition.of(true) })
     },
     compositionend() { this.end() },
+    input() { if (this.ending) this.schedule() },
+    keydown(event) { if (this.ending && !event.isComposing && !this.view.compositionStarted) this.finish() },
+    blur() { if (this.view.state.field(tableComposition, false)) this.end() },
   },
 })
+
+/** 切换标签、源码模式前提交当前 DOM 输入，快照不能带走未收口的组字状态。 */
+export function finishTableComposition(view: EditorView): void {
+  if (!view.state.field(tableComposition, false)) return
+  view.contentDOM.blur()
+  view.plugin(tableCompositionInput)?.finish()
+}
+
+/** 文字变更不碰格线和行内代码边界时，旧格可直接映射，不先构造会被过滤器丢弃的新状态。 */
+function mappedSelectionCell(tr: Transaction): TableCell | undefined {
+  let cell: TableCell | undefined, local = true
+  tr.changes.iterChanges((from, to, _next, _end, inserted) => {
+    const found = cellAround(tr.startState, from, to)
+    if (!found || from < found.start || to > found.end ||
+      /[|\\`\r\n]/.test(tr.startState.sliceDoc(from, to) + inserted.toString()) ||
+      (cell && cell.left !== found.left)) local = false
+    else cell = found
+  })
+  if (!local || !cell) return undefined
+  const left = tr.changes.mapPos(cell.left, -1), right = tr.changes.mapPos(cell.right, 1)
+  const text = tr.newDoc.sliceString(left, right)
+  const start = left + (text.match(/^[ \t]*/)?.[0].length ?? 0)
+  const end = Math.max(start, right - (text.match(/[ \t]*$/)?.[0].length ?? 0))
+  const head = tr.newSelection.main.head
+  if (head < left || head > right) return undefined
+  // 无首尾竖线的单列表，删空内容可能让整行退出表格。
+  const row = tr.newDoc.lineAt(left)
+  if (!tr.newDoc.sliceString(row.from, left).includes('|') && !tr.newDoc.sliceString(right, row.to).includes('|')) return undefined
+  return { from: tr.changes.mapPos(cell.from, -1), to: tr.changes.mapPos(cell.to, 1), left, right, start, end }
+}
 
 export const tableEditing = [
   tableComposition,
@@ -1448,9 +1510,10 @@ export const tableEditing = [
   tableGeometry.of([]),
   tableLayout,
   EditorState.transactionFilter.of(tr => {
-    if (!tr.selection || tr.state.field(tableComposition, false) || tr.isUserEvent('input.type.compose') || tr.effects.some(effect => effect.is(setVirtualCell))) return tr
+    if (!tr.selection || tr.startState.field(tableComposition, false) || tr.isUserEvent('input.type.compose') || tr.effects.some(effect => effect.is(setVirtualCell))) return tr
     const range = tr.newSelection.main
-    const current = currentCell(tr.state)
+    const mapped = tr.docChanged ? mappedSelectionCell(tr) : undefined
+    const current = mapped ? { cell: mapped, target: { to: mapped.right } } : currentCell(tr.state)
     if (!current) return tr
     const { target, cell } = current
     let head = range.head

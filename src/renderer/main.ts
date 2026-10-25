@@ -1,4 +1,4 @@
-import { createEditor, focusEditor, getMarkdown, getEditorView, getEditorScroller, onEditorJumpPhase, setMarkdown, setEditorEditable, getEditorState, restoreEditorState, applyMarkdownStyle, runFormatCommand, jumpToLine, jumpToHeading, setCleanExport, setDocumentFileUrl, remeasureEditor, type FormatCommandId } from './editor/editor'
+import { createEditor, finishEditorComposition, focusEditor, getMarkdown, getEditorView, getEditorScroller, onEditorJumpPhase, setMarkdown, setEditorEditable, getEditorState, restoreEditorState, applyMarkdownStyle, runFormatCommand, jumpToLine, jumpToHeading, setCleanExport, setDocumentFileUrl, remeasureEditor, type FormatCommandId } from './editor/editor'
 import { markdownForWord } from './editor/mermaid-export'
 import { withDiagramZoomPaused } from './editor/mermaid-bridge'
 import { jumpToSourceLine, sourcePositionTop } from './editor/source-line'
@@ -310,7 +310,8 @@ function tabLabel(tab: DocumentTab): string {
 
 // Read the live state back into the active tab's record. Called before every
 // switch, close and bar render, so the records and the screen cannot disagree.
-function captureActiveTab(): void {
+function captureActiveTab(commitInput = false): void {
+  if (commitInput) finishEditorComposition()
   const tab = activeTab()
   if (!tab) return
   // The path is the tab's identity and only changes where a document is really
@@ -553,7 +554,7 @@ function ensureTab(): DocumentTab {
 
 async function openNewTab(): Promise<void> {
   const previous = activeTab()
-  captureActiveTab()
+  captureActiveTab(true)
   if (!await saveTabForLeaving(previous)) return
   const tab: DocumentTab = {
     id: `tab-${nextTabId++}`,
@@ -607,7 +608,7 @@ async function activateTab(id: string): Promise<void> {
   const target = tabs.find((tab) => tab.id === id)
   if (!target) return
   const previous = activeTab()
-  captureActiveTab()
+  captureActiveTab(true)
   if (!await saveTabForLeaving(previous)) return
   switchingTab = true
   try {
@@ -678,7 +679,7 @@ async function closeTab(id: string): Promise<void> {
   if (index < 0) return
   const tab = tabs[index]
   if (tab.id === activeTabId) {
-    captureActiveTab()
+    captureActiveTab(true)
     if (!await saveTabForLeaving(tab)) return
     if (tab.dirty && !tab.filePath && !confirmDiscardUntitled()) return
   } else if (tab.dirty) {
@@ -1046,6 +1047,7 @@ function caretViewportOffset(fraction: number, height: number, lineHeight: numbe
 }
 
 function toggleSourceMode(): void {
+  finishEditorComposition()
   if (sourceModeActive) {
     const ta = sourceEl()
     const { selectionStart, selectionEnd, selectionDirection } = ta
@@ -1920,7 +1922,7 @@ async function init(): Promise<void> {
 
   // Main asks for an authoritative snapshot before any close or quit.
   api.onRequestDocumentState(async (requestId) => {
-    captureActiveTab()
+    captureActiveTab(true)
     // Report every tab that still has unsaved content. The main process writes
     // the ones with a path and refuses to close on the untitled ones, so a
     // background tab can never be dropped silently.
