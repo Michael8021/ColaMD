@@ -468,6 +468,7 @@ const tableLayout = ViewPlugin.fromClass(class {
   private readonly rules = new Map<number, string>()
   private probes: { key: string; min: HTMLElement; max: HTMLElement }[] = []
   private signature = ''
+  private numericCells = new Set<number>()
 
   constructor(private readonly view: EditorView) {
     this.measure.className = 'cm-content'
@@ -479,15 +480,15 @@ const tableLayout = ViewPlugin.fromClass(class {
 
   update(update: ViewUpdate): void {
     const reconfigured = update.transactions.some(tr => tr.reconfigured && !tr.annotation(tableGeometryUpdate))
-    if (reconfigured) this.signature = ''
+    if (reconfigured) { this.signature = ''; this.numericCells.clear() }
     const composing = !!update.state.field(tableComposition, false)
     const compositionEnded = update.transactions.some(tr => tr.effects.some(effect => effect.is(setTableComposition) && !effect.value))
     if (update.docChanged) {
       const localRows = composing || update.transactions.every(tr => !tr.docChanged || !!changedTableRow(tr))
-      let numericChanged = composing
-      if (localRows && !composing) for (const tr of update.transactions) tr.changes.iterChanges((from, to, next, end) => {
-        const before = cellAround(tr.startState, from, to), after = cellAround(tr.state, next, end)
-        if ([before && tr.startState.sliceDoc(before.start, before.end), after && tr.state.sliceDoc(after.start, after.end)].some(text => text && NUMERIC.test(text))) numericChanged = true
+      this.numericCells = localRows && !composing ? new Set([...this.numericCells].map(pos => update.changes.mapPos(pos, -1))) : new Set()
+      if (localRows && !composing) update.changes.iterChangedRanges((_from, _to, next, end) => {
+        const cell = cellAround(update.state, next, end)
+        if (cell && NUMERIC.test(update.state.sliceDoc(cell.start, cell.end))) this.numericCells.add(cell.left)
       })
       // 格内编辑只改变文字，沿用列宽；否则少一个字也会重分配整张表，把光标横向推走。
       // 映射各格的边界，只有格线、行列和对齐都没变时才保留布局。
@@ -507,7 +508,7 @@ const tableLayout = ViewPlugin.fromClass(class {
         if (localRows) {
           retained.set(mapped, { ...layout, length: update.changes.mapPos(from + layout.length, composing ? 1 : -1) - mapped,
             boundaries: layout.boundaries.map((pos, index) => update.changes.mapPos(from + pos, index % 2 ? 1 : -1) - mapped) })
-          if (!numericChanged) retainRule(from, mapped)
+          if (!composing) retainRule(from, mapped)
           continue
         }
         const next = tableAt(update.state, mapped)
@@ -526,6 +527,14 @@ const tableLayout = ViewPlugin.fromClass(class {
       for (const [from, css] of rules) this.rules.set(from, css)
     }
     if (!composing && (compositionEnded || reconfigured || update.docChanged || update.viewportChanged || update.geometryChanged)) this.schedule()
+  }
+
+  private layoutRules(from: number, layout: TableLayout): string {
+    const table = `[data-table-layout="${this.id}"] [data-table-from="${from}"]`
+    const total = sum(layout.columns)
+    const rules = layout.columns.map((width, column) => `${table} .cm-md-table-cell[data-column="${column}"]{width:${width / total * 100}%}`)
+    for (const column of layout.wrapColumns) rules.push(`${table} .cm-md-table-number[data-column="${column}"]{white-space:normal}`)
+    return rules.join('\n')
   }
 
   private content(cell: TableCell): HTMLElement {
@@ -564,7 +573,7 @@ const tableLayout = ViewPlugin.fromClass(class {
       const sample = view.contentDOM.querySelector<HTMLElement>('.cm-md-table-cell')
       if (!sample) {
         this.metrics.clear()
-        return { doc: view.state.doc, layouts: [], pending: [] }
+        return { doc: view.state.doc, layouts: [], pending: [], wrapping: [], checked: [] }
       }
       const style = getComputedStyle(sample)
       const signature = `${document.body.className}:${style.fontFamily}:${style.fontSize}:${style.letterSpacing}:${style.paddingLeft}:${style.paddingRight}:${style.minWidth}:${view.defaultCharacterWidth}`
@@ -588,12 +597,40 @@ const tableLayout = ViewPlugin.fromClass(class {
           - parseFloat(wrapperStyle.borderLeftWidth) - parseFloat(wrapperStyle.borderRightWidth)
         tables.set(from, Math.min(wrapper.clientWidth, available) - parseFloat(wrapperStyle.paddingLeft) - parseFloat(wrapperStyle.paddingRight))
       })
+      const numeric = new Map<number, { pos: number; text: string; column: number; header: boolean }[]>()
+      for (const pos of this.numericCells) {
+        const node = rowNodeAt(view.state, pos)
+        if (!node) continue
+        const row = readRow(view.state, node)
+        const column = row.cells.findIndex(cell => cell.left === pos)
+        if (column < 0) continue
+        const cell = row.cells[column], text = view.state.sliceDoc(cell.start, cell.end)
+        const from = node.parent!.from
+        const cells = numeric.get(from) ?? []
+        cells.push({ pos, text, column, header: node.name === 'TableHeader' })
+        numeric.set(from, cells)
+      }
+      const wrapping: { from: number; layout: TableLayoutSnapshot }[] = []
+      const checked = [...numeric].filter(([from]) => tables.has(from)).flatMap(([, cells]) => cells.map(cell => cell.pos))
       const layouts: (TableLayout & { table: MarkdownTable })[] = []
       // 列宽快照和规则属于当前文档；仅内容度量随视口释放，不保留旧语法表对象。
       const usedMetrics = new Set<string>()
       for (const [from, width] of tables) {
         let cached = this.layouts.get(from)
-        if (cached?.width === width && this.rules.has(from)) continue
+        if (cached?.width === width && this.rules.has(from)) {
+          const wrap = new Set(cached.wrapColumns)
+          for (const cell of numeric.get(from) ?? []) {
+            if (!NUMERIC.test(cell.text) || cell.column >= cached.columns.length || wrap.has(cell.column)) continue
+            this.canvas.font = `${cell.header ? '600' : '400'} ${style.fontSize} ${style.fontFamily}`
+            const required = this.canvas.measureText(cell.text).width + (parseFloat(style.letterSpacing) || 0) * cell.text.length
+              + parseFloat(style.paddingLeft) + parseFloat(style.paddingRight) + 2
+            if (required > cached.columns[cell.column]) wrap.add(cell.column)
+          }
+          // 列宽固定时，只需判断新数字是否超宽。已放开的列中，短数字仍不会换行；
+          // 宽度、字体或结构变化时才重新计算整表的折行列。
+          if (wrap.size !== cached.wrapColumns.length) wrapping.push({ from, layout: { ...cached, wrapColumns: [...wrap] } })
+          continue
+        }
         const table = tableAt(view.state, from)
         if (!table) continue
         if (cached && (cached.length !== table.to - table.from || !this.rules.has(table.from))) {
@@ -657,18 +694,19 @@ const tableLayout = ViewPlugin.fromClass(class {
         layouts.push({ table, width, wrapColumns, columns })
       }
       if (usedMetrics.size) for (const key of this.metrics.keys()) if (!usedMetrics.has(key)) this.metrics.delete(key)
-      return { doc: view.state.doc, layouts, pending: [...pending].map(([key, value]) => ({ key, ...value })) }
+      return { doc: view.state.doc, layouts, wrapping, checked, pending: [...pending].map(([key, value]) => ({ key, ...value })) }
     }, write: plan => {
       this.measure.replaceChildren()
       this.probes = []
       if (!plan || plan.doc !== this.view.state.doc) return
+      for (const pos of plan.checked) this.numericCells.delete(pos)
+      for (const { from, layout } of plan.wrapping) {
+        this.layouts.set(from, layout)
+        this.rules.set(from, this.layoutRules(from, layout))
+      }
       for (const layout of plan.layouts) {
         this.layouts.set(layout.table.from, tableLayoutSnapshot(layout.table, layout))
-        const table = `[data-table-layout="${this.id}"] [data-table-from="${layout.table.from}"]`
-        const total = sum(layout.columns)
-        const rules = layout.columns.map((width, column) => `${table} .cm-md-table-cell[data-column="${column}"]{width:${width / total * 100}%}`)
-        for (const column of layout.wrapColumns) rules.push(`${table} .cm-md-table-number[data-column="${column}"]{white-space:normal}`)
-        this.rules.set(layout.table.from, rules.join('\n'))
+        this.rules.set(layout.table.from, this.layoutRules(layout.table.from, layout))
       }
       const css = [...this.rules.values()].join('\n')
       if (this.style.textContent !== css) {

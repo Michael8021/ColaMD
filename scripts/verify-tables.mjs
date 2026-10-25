@@ -342,6 +342,25 @@ try {
         check(`${target} 编辑不读取整张表的所有格子`, refs.tableSliced < original.length / 3, JSON.stringify(refs))
       }
     },
+    async numericIncremental() {
+      const original = '| A | B |\n|---|---|\n' + '| 123 | label |\n'.repeat(600)
+      await setDoc(original)
+      await select('123', 3)
+      await evaluate(`v.requestMeasure();v.coordsAtPos(v.state.selection.main.head)`)
+      const widths = await evaluate(`[...v.contentDOM.querySelectorAll('.cm-md-table-header .cm-md-table-cell')].map(cell=>cell.getBoundingClientRect().width)`)
+      await evaluate(`window.numericRead = 0; window.numericTextPrototype = Object.getPrototypeOf(v.state.doc); window.numericSlice = numericTextPrototype.sliceString;
+        numericTextPrototype.sliceString = function(from,to=this.length,...args) { if(/readRow|readTable|tableLayoutSnapshot/.test(new Error().stack)) numericRead+=to-from;return numericSlice.call(this,from,to,...args) }`)
+      try {
+        await send('Input.insertText', { text: '1' })
+        await evaluate(`v.requestMeasure();v.coordsAtPos(v.state.selection.main.head)`)
+      } finally { await evaluate('numericTextPrototype.sliceString = numericSlice') }
+      console.log('数字增量读取字符数：' + await evaluate('numericRead'))
+      check('大表数字编辑的布局复核不读取整表', await evaluate('numericRead') < original.length / 3, String(await evaluate('numericRead')))
+      await send('Input.insertText', { text: '1234567890'.repeat(12) })
+      await evaluate(`v.requestMeasure();v.coordsAtPos(v.state.selection.main.head)`)
+      const geometry = await evaluate(`(() => {const cell=v.contentDOM.querySelector('.cm-md-table-number');return {widths:[...v.contentDOM.querySelectorAll('.cm-md-table-header .cm-md-table-cell')].map(cell=>cell.getBoundingClientRect().width),overflow:cell.scrollWidth-cell.clientWidth,wrap:getComputedStyle(cell).whiteSpace}})()`)
+      check('增量数字超宽时放开折行且保留列宽', geometry.wrap !== 'nowrap' && geometry.overflow <= 1 && widths.every((width,index)=>Math.abs(width-geometry.widths[index])<=1),JSON.stringify({widths,geometry}))
+    },
     async reset() {
       await setDoc('| A | B |\n|---|---|\n| x | y |\n')
       await setDoc('正文\n')
