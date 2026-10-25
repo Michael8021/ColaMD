@@ -177,16 +177,23 @@ async function runtimeChecks() {
     await wait(`document.title==='source.md' && !!document.querySelector('[data-href]')`, 'source loaded')
     const openSource = async () => {
       await evaluate(`window.electronAPI.openExternal(${JSON.stringify(source)})`)
-      await wait(`document.title==='source.md'`, 'return to source')
-      await sleep(150)
+      await wait(`document.title==='source.md' && document.querySelector('#editor .cm-content')?.cmTile?.root?.view.state.doc.toString()===${JSON.stringify(sourceText)}`, 'return to source document')
     }
     const click = async (label, modifiers = MOD) => {
-      const point = await evaluate(`(() => {
-        const a=[...document.querySelectorAll('#editor [data-href], #editor a[href]')].find(a=>a.textContent===${JSON.stringify(label)});
-        if(!a)return null; a.scrollIntoView({block:'center',behavior:'instant'});
-        const r=[...a.getClientRects()].find(r=>r.width>2&&r.height>2);
-        return r?{x:r.x+r.width/2,y:r.y+r.height/2}:null;
-      })()`)
+      let point
+      // 标题更新和视口装饰并非同一时刻；先把真实文档里的目标滚入视口，再等可点击矩形。
+      for (let i = 0; i < 80 && !point; i++) {
+        point = await evaluate(`(() => {
+          const view=document.querySelector('#editor .cm-content')?.cmTile?.root?.view;
+          const at=view?.state.doc.toString().indexOf('['+${JSON.stringify(label)}+']');
+          if(at>=0) { view.dispatch({selection:{anchor:at},scrollIntoView:true});view.coordsAtPos(at); }
+          const a=[...document.querySelectorAll('#editor [data-href], #editor a[href]')].find(a=>a.textContent===${JSON.stringify(label)});
+          if(!a)return null; a.scrollIntoView({block:'center',behavior:'instant'});
+          const r=[...a.getClientRects()].find(r=>r.width>2&&r.height>2);
+          return r?{x:r.x+r.width/2,y:r.y+r.height/2}:null;
+        })()`)
+        if (!point) await sleep(100)
+      }
       assert(point, `Link not rendered: ${label}`)
       for (const type of ['mousePressed', 'mouseReleased']) await send('Input.dispatchMouseEvent', { type, ...point, button: 'left', clickCount: 1, modifiers })
     }
