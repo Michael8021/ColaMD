@@ -294,7 +294,8 @@ function eachTable(state: EditorState, visit: (node: SyntaxNode) => void): void 
   } })
 }
 
-interface TableRange { from: number; to: number }
+interface TableRange { from: number; to: number; id: number }
+let tableId = 0
 
 function tableNodes(state: EditorState): SyntaxNode[] {
   const nodes: SyntaxNode[] = []
@@ -311,7 +312,7 @@ function tableWrappers(state: EditorState, tables: TableRange[]) {
       classes.push(...(deco.spec.class ?? '').split(' ').filter((name: string) => name.startsWith('cm-md-page-') || name === 'cm-md-blockquote' || /^cm-md-li(?:-\d+)?$/.test(name)))
     })
     // wrapper 按块起点归属；终点取末行起点，文末临时段落不属于表格。
-    wrappers.push(BlockWrapper.create({ tagName: 'div', attributes: { class: `cm-md-table-widget ${classes.join(' ')}`, 'data-table-from': String(node.from), role: 'table' } }).range(first, state.doc.lineAt(node.to).from))
+    wrappers.push(BlockWrapper.create({ tagName: 'div', attributes: { class: `cm-md-table-widget ${classes.join(' ')}`, 'data-table-id': String(node.id), role: 'table' } }).range(first, state.doc.lineAt(node.to).from))
   }
   return BlockWrapper.set(wrappers, true)
 }
@@ -350,7 +351,9 @@ function decorateRow(state: EditorState, row: TableRow, rowIndex: number, align:
   }
 }
 
-function tableDecorations(state: EditorState, nodes = tableNodes(state)) {
+function tableDecorations(state: EditorState, nodes = tableNodes(state), previous: TableRange[] = []) {
+  const identities = new Map(previous.map(table => [table.from, table.id]))
+  const tables = nodes.map(({ from, to }) => ({ from, to, id: identities.get(from) ?? ++tableId }))
   const ranges: DecorationRange[] = []
   const prefixes: Range<Decoration>[] = []
   nodes.forEach(node => {
@@ -359,7 +362,7 @@ function tableDecorations(state: EditorState, nodes = tableNodes(state)) {
     const delimiter = state.doc.lineAt(table.delimiter.from)
     ranges.push({ from: delimiter.from, to: delimiter.from, deco: Decoration.line({ class: 'cm-md-table-delimiter' }) })
   })
-  return { decorations: Decoration.set(ranges.map(range => range.deco.range(range.from, range.to)), true), prefixes: Decoration.set(prefixes, true), wrappers: tableWrappers(state, nodes), tables: nodes.map(({ from, to }) => ({ from, to })) }
+  return { decorations: Decoration.set(ranges.map(range => range.deco.range(range.from, range.to)), true), prefixes: Decoration.set(prefixes, true), wrappers: tableWrappers(state, tables), tables }
 }
 
 function rowNodeAt(state: EditorState, pos: number): SyntaxNode | null {
@@ -389,7 +392,7 @@ const tableField = StateField.define<ReturnType<typeof tableDecorations>>({
   create: tableDecorations,
   update(value, tr) {
     const changed = tr.docChanged ? changedTableRow(tr) : null
-    const tables = value.tables.map(table => ({ from: tr.changes.mapPos(table.from, -1), to: tr.changes.mapPos(table.to, 1) }))
+    const tables = value.tables.map(table => ({ ...table, from: tr.changes.mapPos(table.from, -1), to: tr.changes.mapPos(table.to, 1) }))
     const mapped = { decorations: value.decorations.map(tr.changes), prefixes: value.prefixes.map(tr.changes),
       wrappers: tr.docChanged ? changed && tables.every((table, index) => table.from === value.tables[index].from)
         ? value.wrappers.map(tr.changes) : tableWrappers(tr.state, tables) : value.wrappers, tables }
@@ -431,18 +434,31 @@ const tableField = StateField.define<ReturnType<typeof tableDecorations>>({
     })
     const removed = tables.filter((_table, index) => !retained.has(index))
     if (!rebuild.length && !removed.length) return mapped
-    const replacement = tableDecorations(tr.state, rebuild)
+    const replacement = tableDecorations(tr.state, rebuild, tables)
+    const nextByRange = new Map([...tables, ...replacement.tables].map(table => [`${table.from}:${table.to}`, table]))
+    const nextTables = nodes.map(({ from, to }) => nextByRange.get(`${from}:${to}`)!)
     const affected = [...removed, ...rebuild].map(table => ({ from: tr.state.doc.lineAt(table.from).from, to: table.to }))
     const filter = (from: number, to: number) => !affected.some(table => from <= table.to && to >= table.from)
     const add = (set: DecorationSet) => { const ranges: Range<Decoration>[] = []; set.between(0, tr.state.doc.length, (from, to, deco) => { ranges.push(deco.range(from, to)) }); return ranges }
     return { decorations: mapped.decorations.update({ filter, add: add(replacement.decorations), sort: true }),
       prefixes: mapped.prefixes.update({ filter, add: add(replacement.prefixes), sort: true }),
-      wrappers: tableWrappers(tr.state, nodes), tables: nodes.map(({ from, to }) => ({ from, to })) }
+      wrappers: tableWrappers(tr.state, nextTables), tables: nextTables }
   },
   // 格内替换不跨行，通过视图提供，避免高度树每键比较整表的行内替换。
   // 表格前缀优先于引用、列表标记；单元格仍包在行内装饰外面。
   provide: field => [EditorView.outerDecorations.of(view => view.state.field(field).decorations), Prec.high(EditorView.decorations.of(view => view.state.field(field).prefixes)), EditorView.blockWrappers.from(field, value => value.wrappers)],
 })
+
+// 身份随表格范围映射；正文编辑只改变位置，不更换 wrapper 或列宽选择器。
+function tableDOMSelector(state: EditorState, from: number): string {
+  const id = state.field(tableField).tables.find(table => table.from === from)?.id
+  return `[data-table-id="${id}"]`
+}
+
+function tableDOMRange(view: EditorView, element: HTMLElement): TableRange | undefined {
+  const id = Number(element.closest<HTMLElement>('.cm-md-table-widget')?.dataset.tableId)
+  return view.state.field(tableField).tables.find(table => table.id === id)
+}
 
 let tableLayoutId = 0
 const tableGeometry = new Compartment()
@@ -496,7 +512,7 @@ const tableLayout = ViewPlugin.fromClass(class {
       const rules = new Map<number, string>()
       const retainRule = (from: number, mapped: number) => {
         const css = this.rules.get(from)
-        if (css) rules.set(mapped, css.replaceAll(`[data-table-from="${from}"]`, `[data-table-from="${mapped}"]`))
+        if (css) rules.set(mapped, css)
       }
       for (const [from, layout] of this.layouts) {
         const mapped = update.changes.mapPos(from, -1)
@@ -530,7 +546,7 @@ const tableLayout = ViewPlugin.fromClass(class {
   }
 
   private layoutRules(from: number, layout: TableLayout): string {
-    const table = `[data-table-layout="${this.id}"] [data-table-from="${from}"]`
+    const table = `[data-table-layout="${this.id}"] ${tableDOMSelector(this.view.state, from)}`
     const total = sum(layout.columns)
     const rules = layout.columns.map((width, column) => `${table} .cm-md-table-cell[data-column="${column}"]{width:${width / total * 100}%}`)
     for (const column of layout.wrapColumns) rules.push(`${table} .cm-md-table-number[data-column="${column}"]{white-space:normal}`)
@@ -587,7 +603,8 @@ const tableLayout = ViewPlugin.fromClass(class {
       const tables = new Map<number, number>()
       view.contentDOM.querySelectorAll<HTMLElement>('.cm-md-table-row').forEach(row => {
         const wrapper = row.closest<HTMLElement>('.cm-md-table-widget')!
-        const from = Number(wrapper.dataset.tableFrom)
+        const from = tableDOMRange(view, wrapper)?.from
+        if (from === undefined) return
         if (tables.has(from)) return
         const wrapperStyle = getComputedStyle(wrapper)
         const parent = wrapper.parentElement!
@@ -838,7 +855,7 @@ const emptyCellFocus = ViewPlugin.fromClass(class {
         this.pending = false
         return
       }
-      const input = view.contentDOM.querySelector<HTMLElement>(`[data-table-from="${current.table.from}"] [data-table-row="${current.row}"] [data-column="${current.column}"] .cm-md-table-input`)
+      const input = view.contentDOM.querySelector<HTMLElement>(`${tableDOMSelector(view.state, current.table.from)} [data-table-row="${current.row}"] [data-column="${current.column}"] .cm-md-table-input`)
       if (!input) return
       this.pending = false
       if (input.isContentEditable) input.focus()
@@ -1371,7 +1388,8 @@ function cellAtPoint(view: EditorView, event: Pick<MouseEvent, 'clientX' | 'clie
   const element = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>('.cm-md-table-cell')
   const row = element?.closest<HTMLElement>('.cm-md-table-row')
   if (!element || !row) return null
-  const table = tableAt(view.state, Number(row.closest<HTMLElement>('.cm-md-table-widget')!.dataset.tableFrom))
+  const source = tableDOMRange(view, row)
+  const table = source && tableAt(view.state, source.from)
   const sourceRow = table?.rows[Number(row.dataset.tableRow)]
   if (!sourceRow) return null
   const cell = sourceRow.cells[Number(element.dataset.column)]
@@ -1393,7 +1411,7 @@ function moveVertical(view: EditorView, direction: 1 | -1, extend = false): bool
   const range = view.state.selection.main
   const caret = view.coordsAtPos(range.head)
   const edge = cell && view.coordsAtPos(direction < 0 ? cell.start : cell.end, direction)
-  const element = (r: number) => view.contentDOM.querySelector<HTMLElement>(`[data-table-from="${table.from}"] [data-table-row="${r}"] [data-column="${column}"]`)
+  const element = (r: number) => view.contentDOM.querySelector<HTMLElement>(`${tableDOMSelector(view.state, table.from)} [data-table-row="${r}"] [data-column="${column}"]`)
   const own = element(row)
   const lineHeight = own ? Number.parseFloat(getComputedStyle(own).lineHeight) : 0
   let pos: number | null = null
@@ -1712,7 +1730,8 @@ export const tableEditing = [
       const cell = event.target.closest<HTMLElement>('.cm-md-table-cell')
       const row = cell?.closest<HTMLElement>('.cm-md-table-row')
       if (!cell || !row) return false
-      const table = tableAt(view.state, Number(row.closest<HTMLElement>('.cm-md-table-widget')!.dataset.tableFrom))
+      const range = tableDOMRange(view, row)
+      const table = range && tableAt(view.state, range.from)
       if (!table) return false
       const rowIndex = Number(row.dataset.tableRow)
       const column = Number(cell.dataset.column)

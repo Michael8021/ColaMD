@@ -308,6 +308,39 @@ try {
       await key('z', MOD)
       check('大批 TSV 整体一步撤销', await doc() === original)
     },
+    async paragraphIdentity() {
+      let original = '# 多表正文编辑\n\n'
+      for (let table = 0; table < 120; table++) {
+        original += `第 ${table} 段正文。\n\n| A | B |\n|---|---|\n` + '| item | value |\n'.repeat(25) + '\n'
+      }
+      await setDoc(original)
+      const settle = () => evaluate(`(async () => {
+        v.requestMeasure(); v.coordsAtPos(v.state.selection.main.head);
+        for (let i=0;i<3;i++) await new Promise(resolve=>requestAnimationFrame(resolve));
+      })()`)
+      for (const paragraph of ['第 60 段正文', '第 0 段正文']) {
+        await select(paragraph, 2)
+        await evaluate('v.dispatch({scrollIntoView:true})')
+        await settle()
+        for (const operation of ['打字', '退格']) {
+          await evaluate(`window.unchangedTables=[...v.contentDOM.querySelectorAll('.cm-md-table-widget:has(.cm-md-table-row)')];window.tableStyles=[...v.dom.querySelectorAll('style')].map(style=>style.textContent)`)
+          if (operation === '打字') await type('x')
+          else await key('Backspace')
+          await settle()
+          const result = await evaluate(`({ visible:unchangedTables.length, retained:unchangedTables.filter(table=>table.isConnected).length, stylesUnchanged:JSON.stringify(tableStyles)===JSON.stringify([...v.dom.querySelectorAll('style')].map(style=>style.textContent)) })`)
+          check(`${paragraph}${operation} 不重新挂载未编辑的表格`, result.visible > 0 && result.retained === result.visible, JSON.stringify(result))
+          check(`${paragraph}${operation} 不重写未改变的列宽规则`, result.stylesUnchanged, JSON.stringify(result))
+        }
+      }
+      check('多表正文真实输入和退格保持源码', await doc() === original)
+      await type('x')
+      await settle()
+      await clickCell(1, 0, 0.5)
+      const position = await head(), edited = await doc(), cell = edited.indexOf('item')
+      check('正文插入后点击仍落在第一张表的实际格子', position >= cell && position <= cell + 4, String(position))
+      await type('Z')
+      check('稳定表格身份按当前源码位置输入', await doc() === edited.slice(0, position) + 'Z' + edited.slice(position))
+    },
     async singleState() {
       await setDoc('| A | B |\n|---|---|\n| value | label |\n')
       await evaluate(`(() => {
@@ -713,7 +746,7 @@ try {
   const multiple = '| A | B |\n|---|---:|\n| first | 123 |\n|  | empty |\n\n> | C | D |\n> |---|---|\n> | quoted | tail |\n'
   await setDoc(multiple)
   const tableSnapshot = () => evaluate(`JSON.stringify([...v.contentDOM.querySelectorAll('.cm-md-table-row')].map(row => ({
-    table: row.closest('.cm-md-table-widget').dataset.tableFrom, row: row.dataset.tableRow,
+    table: v.posAtDOM(row.closest('.cm-md-table-widget')), row: row.dataset.tableRow,
     cells: [...row.querySelectorAll('.cm-md-table-cell')].map(cell => [cell.textContent, cell.dataset.column, cell.className, getComputedStyle(cell).textAlign])
   })))`)
   for (const [word, text] of [['first', '**bold**'], ['123', 'word'], ['quoted', '引用文字']]) {
@@ -1405,14 +1438,18 @@ try {
     }
     throw new Error('布局未在预期视口收敛')
   })()`)
-  const reviewColumns = () => evaluate(`[...v.contentDOM.querySelectorAll('[data-table-from="0"] .cm-md-table-header .cm-md-table-cell')].map(cell => cell.getBoundingClientRect().width)`)
+  let reviewTable
+  const locateReviewTable = async () => { reviewTable = await evaluate(`'[data-table-id="' + v.contentDOM.querySelector('.cm-md-table-widget:has(.cm-md-table-header)').dataset.tableId + '"]'`) }
+  const reviewColumns = () => evaluate(`[...v.contentDOM.querySelectorAll('${reviewTable} .cm-md-table-header .cm-md-table-cell')].map(cell => cell.getBoundingClientRect().width)`)
   await setDoc('| A | B |\n|---|---|\n| [link](https://example.com/`a|b`) | END |\n')
-  await settleReviewLayout(`v.contentDOM.querySelectorAll('[data-table-from="0"] .cm-md-table-header .cm-md-table-cell').length === 2`)
+  await locateReviewTable()
+  await settleReviewLayout(`v.contentDOM.querySelectorAll('${reviewTable} .cm-md-table-header .cm-md-table-cell').length === 2`)
   const shortColumns = await reviewColumns()
   check('短链接与短文字不会把几像素内容差距放大为悬殊列宽', Math.abs(shortColumns[0] - shortColumns[1]) <= (shortColumns[0] + shortColumns[1]) * 0.025, JSON.stringify(shortColumns))
   const reviewedLayout = '| A | B |\n|---|---|\n| a | ' + 'W'.repeat(60) + ' |\n\n' + '两张表之间的正文。\n\n'.repeat(160) + '| X | Y |\n|---|---|\n| end | end |\n'
   await setDoc(reviewedLayout)
-  await settleReviewLayout(`v.contentDOM.querySelectorAll('[data-table-from="0"] .cm-md-table-header .cm-md-table-cell').length === 2`)
+  await locateReviewTable()
+  await settleReviewLayout(`v.contentDOM.querySelectorAll('${reviewTable} .cm-md-table-header .cm-md-table-cell').length === 2`)
   const beforeReviewedEdit = await reviewColumns()
   const reviewedCache = await evaluate(`(async () => {
     const first = v.state.doc.toString().indexOf('| a') + 3
@@ -1428,16 +1465,17 @@ try {
   check('增量输入时各列保持初始宽度', beforeReviewedEdit.every((width, column) => Math.abs(width - afterReviewedEdit[column]) < 1), JSON.stringify({ beforeReviewedEdit, afterReviewedEdit }))
   const editedReviewedLayout = await doc()
   await evaluate(`v.dispatch({ selection: { anchor: v.state.doc.length } }); v.scrollDOM.scrollTop = v.scrollDOM.scrollHeight`)
-  await settleReviewLayout(`!!v.contentDOM.querySelector('.cm-md-table-row') && !v.contentDOM.querySelector('[data-table-from="0"] .cm-md-table-row')`)
-  check('离开视口后保留当前文档表格的列宽CSS', await evaluate(`[...v.dom.querySelectorAll('style')].some(style => style.textContent.includes('[data-table-from="0"] .cm-md-table-cell'))`))
+  await settleReviewLayout(`!!v.contentDOM.querySelector('.cm-md-table-row') && !v.contentDOM.querySelector('${reviewTable} .cm-md-table-row')`)
+  check('离开视口后保留当前文档表格的列宽CSS', await evaluate(`[...v.dom.querySelectorAll('style')].some(style => style.textContent.includes('${reviewTable} .cm-md-table-cell'))`))
   await evaluate(`v.scrollDOM.scrollTop = 0`)
-  await settleReviewLayout(`!!v.contentDOM.querySelector('[data-table-from="0"] .cm-md-table-header')`)
+  await settleReviewLayout(`!!v.contentDOM.querySelector('${reviewTable} .cm-md-table-header')`)
   const returnedReviewedColumns = await reviewColumns()
   check('编辑后访问另一张表再返回保持列宽与原文', afterReviewedEdit.every((width, column) => Math.abs(width - returnedReviewedColumns[column]) < 1) && await doc() === editedReviewedLayout, JSON.stringify({ afterReviewedEdit, returnedReviewedColumns }))
 
   const openEndedTable = '| A | B |\n|---|---|\n| a | LAST' + 'W'.repeat(60)
   await setDoc(openEndedTable)
-  await settleReviewLayout(`v.contentDOM.querySelectorAll('[data-table-from="0"] .cm-md-table-header .cm-md-table-cell').length === 2`)
+  await locateReviewTable()
+  await settleReviewLayout(`v.contentDOM.querySelectorAll('${reviewTable} .cm-md-table-header .cm-md-table-cell').length === 2`)
   const openEndedColumns = await reviewColumns()
   await select('a', 1)
   await type('W'.repeat(120))
@@ -1446,7 +1484,7 @@ try {
   const openEndedEdited = await doc()
   check('省略尾竖线的表格也只导航不改文档', openEndedEdited === openEndedTable.replace('| a |', '| a' + 'W'.repeat(120) + ' |') && await paragraphFocused(), openEndedEdited)
   await type('正文')
-  await settleReviewLayout(`!!v.contentDOM.querySelector('[data-table-from="0"] .cm-md-table-header')`)
+  await settleReviewLayout(`!!v.contentDOM.querySelector('${reviewTable} .cm-md-table-header')`)
   const openEndedAfter = await reviewColumns()
   check('省略尾竖线时首次表外输入不改变固定列宽', openEndedColumns.every((width, column) => Math.abs(width - openEndedAfter[column]) < 1) && await doc() === openEndedEdited + '\n\n正文', JSON.stringify({ openEndedColumns, openEndedAfter }))
 
@@ -1464,9 +1502,9 @@ try {
         const row = table.querySelector('.cm-md-table-row')
         if (!row || rect.bottom < 36 || rect.top > innerHeight) return
         const current = Array.from(row.querySelectorAll('.cm-md-table-cell')).map(cell => cell.getBoundingClientRect().width)
-        const last = previous.get(table.dataset.tableFrom)
+        const last = previous.get(table.dataset.tableId)
         if (last) current.forEach((width, column) => { delta = Math.max(delta, Math.abs(width - last[column])) })
-        previous.set(table.dataset.tableFrom, current); samples++
+        previous.set(table.dataset.tableId, current); samples++
       })
       const bottom = v.scrollDOM.scrollHeight - v.scrollDOM.clientHeight
       for (const direction of [1, -1]) for (let offset = 0; offset <= bottom; offset += 280) {
