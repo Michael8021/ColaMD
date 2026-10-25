@@ -12,6 +12,7 @@
 import { type EditorState, type SelectionRange } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
 import { createEditorCore, getEditorHandle, type EditorHandle } from './core'
+import { finishTableComposition } from './table-editing'
 import { footnoteDefinitions } from './footnotes'
 import { selectionHTMLFrom } from './clean-html'
 import { renderWholeDocument, restoreViewport } from '../print-layout'
@@ -21,7 +22,6 @@ import { runFormatCommand as runFormat, type FormatCommandId } from './format-co
 import { isChinese } from '../ui-language'
 import { headingAnchorLine } from './heading-anchor'
 import { isDiagramZoomed } from './mermaid-bridge'
-import { finishTableComposition } from './table-editing'
 
 // katex 的样式表仍要引，公式 widget 里渲出来的 HTML 靠它排版。
 import 'katex/dist/katex.min.css'
