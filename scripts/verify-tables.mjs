@@ -288,6 +288,53 @@ try {
   check('空格子内 Shift+Enter 插入格内换行', (await doc()).includes('||上海|<br>||'), await doc())
   await key('z', MOD)
   check('空格子换行可撤销', await doc() === emptyCases)
+  // 点击和方向键之外的路径（删空、撤销、恢复状态、程序化选区）把光标带进空格子时，
+  // 同样要由那一格的输入框接住，否则光标撑满整格、打的字落进下一行。
+  const emptyFocus = (row, column) => evaluate(`(async () => {
+    for (let i = 0; i < 20; i++) {
+      const input = document.activeElement
+      if (input.classList.contains('cm-md-table-input') && input.closest('.cm-md-table-row').dataset.tableRow === '${row}' && input.closest('.cm-md-table-cell').dataset.column === '${column}' && getComputedStyle(document.querySelector('.cm-cursorLayer')).display === 'none') return true
+      await new Promise(resolve => setTimeout(resolve, 25))
+    }
+    return false
+  })()`)
+  const undoTo = async text => { for (let i = 0; i < 6 && await doc() !== text; i++) await key('z', MOD) }
+  await select('等待', 2)
+  await key('Backspace')
+  await key('Backspace')
+  check('删空格子后由格内输入框接住', await emptyFocus(1, 3), await evaluate('document.activeElement.className'))
+  await type('甲')
+  check('删空格子后输入留在原格', (await doc()).split('\n')[2].replace(/\s/g, '') === '||香港||甲|', await doc())
+  await undoTo(emptyCases)
+  check('删空格子与输入可撤销', await doc() === emptyCases)
+  await clickCell(1, 0)
+  await type('戊')
+  await key('z', MOD)
+  check('撤销回到空格子由格内输入框接住', await doc() === emptyCases && await emptyFocus(1, 0), await doc())
+  await clickCell(1, 0)
+  await type(' ')
+  await type('乙')
+  check('空格子先输入空格再输入文字仍在本格', (await doc()).split('\n')[2].replace(/\s/g, '') === '|乙|香港||等待|', await doc())
+  await undoTo(emptyCases)
+  await clickCell(2, 2)
+  await evaluate(`(() => { const state = v.state; v.setState(state); v.focus() })()`)
+  check('恢复编辑状态后由空格子输入框接住', await emptyFocus(2, 2))
+  await type('丙')
+  check('恢复编辑状态后输入留在原格', (await doc()).includes('||上海|丙||'), await doc())
+  await undoTo(emptyCases)
+  check('恢复状态后的输入可撤销', await doc() === emptyCases)
+  await evaluate(`v.dispatch({ selection: { anchor: ${emptyCases.length - 1} } }); v.focus()`)
+  check('行尾竖线之后的位置落在第一个缺省格', await emptyFocus(3, 1))
+  await type('丁')
+  check('缺省格输入补齐整行', (await doc()).endsWith('| 缺省 | 丁 |  |  |\n'), await doc())
+  await undoTo(emptyCases)
+  await clickCell(1, 2)
+  check('空格子的光标坐标是一行高而不是整格', await evaluate(`(() => {
+    const caret = v.coordsAtPos(v.state.selection.main.head, v.state.selection.main.assoc || 1), input = document.activeElement.getBoundingClientRect(), cell = document.activeElement.closest('.cm-md-table-cell').getBoundingClientRect()
+    return caret.bottom - caret.top <= input.height + 1 && caret.left >= cell.left && caret.left <= cell.right
+  })()`))
+  await key('a', MOD)
+  check('空格子内全选仍选中全文', await evaluate(`v.state.selection.main.from === 0 && v.state.selection.main.to === v.state.doc.length && document.activeElement === v.contentDOM`))
   const layoutCases = '正文。\n\n## 标题\n\n| 场景 | 示例 | 说明 |\n|---|---|---|\n| 换行 | 第一行<br>第二行<br>第三行 | 三行对齐 |\n| 长英文 | document_export_configuration_preview | 自动折行 |\n'
   await setDoc(layoutCases)
   check('换行的三行首字对齐且长英文没有额外空行', await evaluate(`(() => {
@@ -306,7 +353,7 @@ try {
   check('紧凑表格末字后输入仍属于当前格', await doc() === compact.replace('宽度', '宽度改'))
   await setDoc('> 引用正文\n>\n> | A | B |\n> |---|---|\n> | x | y |\n>\n> 引用结尾\n')
   check('引用表格的边框与正文保持相同缩进', await evaluate(`(() => { const table = document.querySelector('.cm-md-table-widget:has(.cm-md-table-row)'); const quote = document.querySelector('.cm-md-blockquote'); const first = table.querySelector('.cm-md-table-cell').getBoundingClientRect(); const box = table.getBoundingClientRect(); const style = getComputedStyle(table); return table.classList.contains('cm-md-blockquote') && style.borderLeftWidth === getComputedStyle(quote).borderLeftWidth && first.left >= box.left + parseFloat(style.paddingLeft) + parseFloat(style.borderLeftWidth) })()`))
-  check('引用正文前后的表格仍导出为表格', (await exportHTML()).includes('<blockquote><table>'))
+  check('引用正文前后的表格仍导出为表格', await evaluate(`(() => { const root = document.createElement('div'); root.innerHTML = window.__colamdExportDocumentHTML(); return !!root.querySelector('blockquote table') })()`), await exportHTML())
   check('引用竖线在表格上下不断开', await evaluate(`(() => {
     const table = document.querySelector('.cm-md-table-widget:has(.cm-md-table-row)').getBoundingClientRect()
     const lines = [...document.querySelectorAll('.cm-content > .cm-line.cm-md-blockquote')].map(line => line.getBoundingClientRect())
@@ -317,7 +364,7 @@ try {
   await setDoc('| 模块 | 负责人 | 进度 | 日期 | 预算 | 说明 |\n|---|---|---|---|---|---|\n| 表格编辑 | 小林 | 进行中 | 2026-10-23 | 12,800.00 | 这是一段比较长的说明，用来观察列宽是否会给长文字留出足够的空间，避免每行只显示几个字。 |\n')
   check('按内容分配列宽，长说明比短内容更宽', await evaluate(`(() => { const cells = document.querySelectorAll('.cm-md-table-header .cm-md-table-cell'); return cells[5].offsetWidth > cells[0].offsetWidth * 2 && cells[5].offsetWidth > 200 && document.querySelector('.cm-md-table-widget:has(.cm-md-table-row)').offsetWidth <= v.contentDOM.clientWidth })()`))
   const amounts = '| 编号 | 地区 | 产品 | 数量 | 金额（元） | 备注 |\n| :---: | :---: | :--- | ---: | ---: | :--- |\n| 156 | 深圳 | 测试记录 | 26 | 19,258.20 | 这条记录比较长，用来观察多行内容的行高，以及在长表格中连续输入时是否顺畅。 |\n| 157 | 杭州 | 设计稿 | 33 | 19,381.65 | 可以直接修改 |\n| 158 | 成都 | 文档模板 | 40 | 19,505.10 | 可以直接修改 |\n| 159 | 南京 | 图表素材 | 47 | 19,628.55 | 可以直接修改 |\n| 160 | 台北 | 接口说明 | 54 | 19,752.00 | 可以直接修改 |\n'
-  for (const theme of ['light', 'elegant', 'nord']) {
+  for (const theme of themes) {
     await setDoc(amounts)
     await setTheme(theme)
     for (const width of ['780px', '540px']) {
@@ -394,7 +441,7 @@ try {
   await key('z', MOD)
   await select('苹果', 2)
   await paste('`a || b`')
-  check('粘贴连续竖线全部转义', (await doc()).includes('苹果`a \\|\\| b`') && await evaluate(`document.querySelectorAll('.cm-md-table-row')[1].querySelectorAll('.cm-md-table-cell').length`) === 3, await doc())
+  check('粘贴完整代码保留连续竖线且不增加列数', (await doc()).includes('苹果`a || b`') && await evaluate(`document.querySelectorAll('.cm-md-table-row')[1].querySelectorAll('.cm-md-table-cell').length`) === 3, await doc())
   await key('z', MOD)
   await select('苹果', 0, 2)
   await paste('第一行\n第二行')
@@ -406,6 +453,23 @@ try {
   const exportCells = async () => [...(await exportHTML()).matchAll(/<td[^>]*>(.*?)<\/td>/g)].map(match => match[1])
   const cursor = (pos, assoc = 0, userEvent) => evaluate(`(() => { const S = v.state.selection.constructor; v.dispatch({selection:S.create([S.cursor(${pos},${assoc})]),userEvent:${JSON.stringify(userEvent)}}); v.focus() })()`)
   const same = (a, b) => JSON.stringify(a) === JSON.stringify(b)
+  for (const [name, source, text, expected] of [
+    ['已有两格', '| A | B |\n|---|---|\n| x | end |\n', 'a`\t`b', [['a`', '`b']]],
+    ['同时扩列增行', '| A | B |\n|---|---|\n| x | end |\n', 'a`\t`b\t尾\n😀`\t`c\t末', [['a`', '`b', '尾'], ['😀`', '`c', '末']]],
+    ['引用容器', '> | A | B |\n> |---|---|\n> | x | end |\n', 'a`\t`b', [['a`', '`b']]],
+  ]) {
+    await setDoc(source)
+    await sleep(550)
+    await select('x')
+    await paste(text)
+    const pasted = await doc()
+    const actual = await Promise.all(expected.map((_, index) => rowCells(index + 1)))
+    check(`${name} TSV反引号不跨格配对`, same(actual, expected), JSON.stringify({ actual, source: pasted }))
+    await key('z', MOD)
+    check(`${name} TSV保护与扩展一步撤销`, await doc() === source, await doc())
+    await key('z', MOD | 8)
+    check(`${name} TSV保护与扩展一步重做`, await doc() === pasted, await doc())
+  }
   const compactSlash = '|A|B|\n|---|---|\n|x|y|\n'
   const compactTyped = `|A|B|\n|---|---|\n|x${S}${S}|y|\n`
   await setDoc(compactSlash)
@@ -459,7 +523,7 @@ try {
   await setDoc(literal)
   await select('|b', 0, 1)
   const cut = await evaluate(`(() => { const data = new DataTransfer(); v.contentDOM.dispatchEvent(new ClipboardEvent('cut', {clipboardData: data, bubbles: true, cancelable: true})); return data.getData('text/plain') })()`)
-  check('剪切字面竖线时连同转义符', await doc() === removed && cut.includes('|'), JSON.stringify([await doc(), cut]))
+  check('剪切字面竖线时连同转义符', await doc() === removed && cut === '|', JSON.stringify([await doc(), cut]))
   await key('z', MOD)
   check('剪切字面竖线一步撤销', await doc() === literal, await doc())
 
@@ -541,16 +605,18 @@ try {
   })()`)
   await sleep(100)
   check('拖走落单反斜杠后的字不转义右侧竖线', await doc() === `|A|B|\n|---|---|\n|x${S}${S}|z|\n\ny尾巴\n` && same(await rowCells(1), [`x${S}`, 'z']), await doc())
+  check('拖动改写后仍选中移动的文字', await evaluate('v.state.sliceDoc(v.state.selection.main.from,v.state.selection.main.to)') === 'y', JSON.stringify(await selection()))
   await key('z', MOD)
   check('拖动移动一步撤销', await doc() === dragged, await doc())
   await setDoc(dragged)
-  await evaluate(`v.dispatch({changes:{from:${dragged.indexOf('z')},insert:'p|q'},userEvent:'input.drop'})`)
+  await evaluate(`v.dispatch({changes:{from:${dragged.indexOf('z')},insert:'p|q'},selection:{anchor:${dragged.indexOf('z')},head:${dragged.indexOf('z') + 3}},userEvent:'input.drop'})`)
   check('拖进格子的竖线自动转义', (await doc()).includes(`|p${S}|qz|`) && same(await rowCells(1), [`x${S}y`, 'p|qz']), await doc())
+  check('拖入改写后选区包含转义后的全部文字', await evaluate('v.state.sliceDoc(v.state.selection.main.from,v.state.selection.main.to)') === `p${S}|q`, JSON.stringify(await selection()))
 
-  // 行内代码里的 \\ 原样显示，删的时候一次一个；竖线转义照旧
+  // 行内代码里的反斜杠与竖线都保留原文，删的时候一次一个。
   const codeCell = `| A | B |\n|---|---|\n| \`C:${S}${S}dir a${S}|b\` | x |\n`
   await setDoc(codeCell)
-  check('行内代码里的双反斜杠原样显示', (await rowCells(1))[0].includes(`C:${S}${S}dir a|b`) && (await exportCells())[0].replace(/<[^>]+>/g, '') === `C:${S}${S}dir a|b`, JSON.stringify([await rowCells(1), await exportCells()]))
+  check('行内代码里的反斜杠原样显示', (await rowCells(1))[0].includes(`C:${S}${S}dir a${S}|b`) && (await exportCells())[0].replace(/<[^>]+>/g, '') === `C:${S}${S}dir a${S}|b`, JSON.stringify([await rowCells(1), await exportCells()]))
   await cursor(codeCell.indexOf('dir'))
   await key('Backspace')
   check('行内代码里删反斜杠一次删一个', await doc() === codeCell.replace(`${S}${S}dir`, `${S}dir`), await doc())
@@ -558,6 +624,222 @@ try {
   await cursor(codeCell.indexOf('dir'))
   await type(S)
   check('行内代码里输入反斜杠就是一个', await doc() === codeCell.replace(`${S}${S}dir`, `${S}${S}${S}dir`), await doc())
+
+  const codePipe = `| A | B |\n|---|---|\n| \`a${S}|b\` | c |\n`
+  await setDoc(codePipe)
+  await cursor(codePipe.indexOf(`${S}|`))
+  await type(S)
+  const codePipeTyped = codePipe.replace(`${S}|`, `${S.repeat(2)}|`)
+  check('代码竖线前输入一根反斜杠只增加一根并保留两格', await doc() === codePipeTyped && same(await rowCells(1), [`a${S}${S}|b`, 'c']), JSON.stringify([await doc(), await rowCells(1)]))
+  await key('z', MOD)
+  check('代码转义接缝修正一步撤销', await doc() === codePipe, await doc())
+  await setDoc(codePipeTyped)
+  await cursor(codePipeTyped.indexOf(`${S.repeat(2)}|`) + 1)
+  await key('Backspace')
+  check('代码竖线前的单根反斜杠可以删除并保留分格', same(await rowCells(1), [`a${S}|b`, 'c']) && await doc() === codePipe, JSON.stringify([await doc(), await rowCells(1)]))
+  check('删除后的光标退回一个字', await head() === codePipeTyped.indexOf(`${S.repeat(2)}|`), await head())
+  await setDoc(codePipeTyped)
+  const codeSlashAt = codePipeTyped.indexOf(`${S.repeat(2)}|`)
+  await select(`${S.repeat(2)}|`, 0, 1)
+  await evaluate(`v.dispatch({changes:[{from:${codeSlashAt},to:${codeSlashAt + 1}},{from:v.state.doc.length,insert:${JSON.stringify(S)}}],userEvent:'move.drop'})`)
+  check('代码反斜杠可移出单元格，源与目标各改一次', await doc() === codePipe + S && same(await rowCells(1), [`a${S}|b`, 'c']), await doc())
+
+  for (let count = 3; count > 0; count--) {
+    const source = codePipe.replace(`${S}|`, `${S.repeat(count)}|`)
+    const expected = codePipe.replace(`${S}|`, `${S.repeat(count - 1)}|`)
+    await setDoc(source)
+    await cursor(source.indexOf('|b'))
+    await key('Backspace')
+    check(`代码反斜杠 ${count}→${count - 1} 保持源码、显示及两格`, await doc() === expected && same(await rowCells(1), [`a${S.repeat(count - 1)}|b`, 'c']), JSON.stringify([await doc(), await rowCells(1)]))
+    await key('z', MOD)
+    check(`代码删除 ${count}→${count - 1} 一步撤销`, await doc() === source, await doc())
+    await key('z', MOD | 8)
+    check(`代码删除 ${count}→${count - 1} 重做`, await doc() === expected, await doc())
+  }
+
+  // 光标的源码位置正确还不够：格内少一个字时，列宽不能重分配，把整格和光标推到另一处。
+  const caretLayoutFixture = `| 试哪一行 | 代码 | 旁边的格子 |\n| --- | --- | --- |\n| 竖线前：三个反斜杠 | \`a${S.repeat(3)}|b\` | 保持不变 |\n| 竖线前：一个反斜杠 | \`a${S}|b\` | 保持不变 |\n| 竖线前：没有反斜杠 | \`a|b\` | 保持不变 |\n`
+  const columnBounds = () => evaluate(`[...document.querySelector('.cm-md-table-header').querySelectorAll('.cm-md-table-cell')].map(cell => { const r=cell.getBoundingClientRect(); return {left:r.left,width:r.width} })`)
+  const sameColumns = (before, after) => before.length === after.length && before.every((cell, column) => Math.abs(cell.left-after[column].left) <= 1 && Math.abs(cell.width-after[column].width) <= 1)
+  const caretPoint = pos => evaluate(`(() => { const r=v.coordsAtPos(${pos}); return {left:r.left,top:r.top} })()`)
+  for (const theme of themes) {
+    await setTheme(theme)
+    for (const direction of ['Backspace', 'Delete']) {
+      await setDoc(caretLayoutFixture)
+      const columns = await columnBounds()
+      const start = caretLayoutFixture.indexOf(S)
+      await select(S.repeat(3), direction === 'Backspace' ? 3 : 0)
+      await sleep(550)
+      for (let count=3; count>0; count--) {
+        const nextHead = start + (direction === 'Backspace' ? count-1 : 0)
+        const expectedPoint = await caretPoint(nextHead)
+        await key(direction)
+        await sleep(80)
+        const point = await caretPoint(await head())
+        const drawn = await evaluate(`(() => { const r=document.querySelector('.cm-cursor').getBoundingClientRect(); return {left:r.left,top:r.top} })()`)
+        const expected = caretLayoutFixture.replace(S.repeat(3)+'|', S.repeat(count-1)+'|')
+        check(`${theme} ${direction} 连删 ${count}→${count-1} 内容与光标位置正确`, await doc() === expected && await head() === nextHead, JSON.stringify({doc:await doc(),head:await head(),nextHead}))
+        check(`${theme} ${direction} 连删 ${count}→${count-1} 列宽保持稳定`, sameColumns(columns, await columnBounds()), JSON.stringify({before:columns,after:await columnBounds()}))
+        check(`${theme} ${direction} 连删 ${count}→${count-1} 可见光标只随删字移动`, Math.abs(point.left-expectedPoint.left)<=1 && Math.abs(point.top-expectedPoint.top)<=1 && Math.abs(drawn.left-point.left)<=1 && Math.abs(drawn.top-point.top)<=1, JSON.stringify({expectedPoint,point,drawn}))
+      }
+      await key('z', MOD)
+      check(`${theme} ${direction} 连删撤销保持原文与列宽`, await doc() === caretLayoutFixture && sameColumns(columns, await columnBounds()), await doc())
+      await key('z', MOD | 8)
+      check(`${theme} ${direction} 连删重做保持原文与列宽`, await doc() === caretLayoutFixture.replace(S.repeat(3)+'|', '|') && sameColumns(columns, await columnBounds()), await doc())
+      await type(S)
+      await sleep(100)
+      check(`${theme} ${direction} 原位置接着输入仍保持列宽`, await head() === start+1 && sameColumns(columns, await columnBounds()) && await doc() === caretLayoutFixture.replace(S.repeat(3)+'|', S+'|'), await doc())
+    }
+  }
+  await setTheme('elegant')
+  const growingNumber = '| 说明 | 数值 | 备注 |\n|---|---|---|\n| 这是一段较长的说明文字 | 1 | 保持不变 |\n'
+  await setDoc(growingNumber)
+  const numberColumns = await columnBounds()
+  await select('1', 1)
+  await type('234567890'.repeat(12))
+  await sleep(200)
+  check('格内追加长数字保持列宽并允许换行', sameColumns(numberColumns, await columnBounds()) && await evaluate(`(() => { const cell=document.querySelector('.cm-md-table-number'); const range=document.createRange(); range.selectNodeContents(cell); return range.getBoundingClientRect().height>parseFloat(getComputedStyle(cell).lineHeight)*1.5 && cell.scrollWidth<=cell.clientWidth+1 })()`), JSON.stringify(await columnBounds()))
+
+  const replaceFixture = '正文 axb。\n\n| A | B |\n|---|---|\n| axb axb | `axb` |\n| a\\|b | tail |\n'
+  const search = async (query, replacement, all = true) => {
+    await sendToWindow('editor:search')
+    await evaluate(`(() => {
+      const query = document.querySelector('.search-input:not(.search-replace-input)')
+      query.value = ${JSON.stringify(query)}; query.dispatchEvent(new Event('input',{bubbles:true}))
+      const replace = document.querySelector('.search-replace-input'); replace.value=${JSON.stringify(replacement)}
+    })()`)
+    const count = await evaluate(`document.querySelector('.search-count').textContent`)
+    if (replacement !== undefined) await evaluate(`document.querySelectorAll('.search-action')[${all ? 1 : 0}].click()`)
+    await sleep(80)
+    return count
+  }
+  const hideSearch = () => evaluate(`document.querySelector('.search-close').click()`)
+  const hiddenSearch = '| A | B |\n|---|---|\n| [label](secret-target "private-title") | a<br>b |\n| <span title="attribute-hidden">visible</span> | end |\n'
+  await setDoc(hiddenSearch)
+  for (const query of ['secret-target', 'private-title', 'br', 'attribute-hidden']) {
+    const count = await search(query)
+    check(`渲染搜索排除隐藏源码 ${query}`, count === '0/0' && await doc() === hiddenSearch, JSON.stringify({ count, source: await doc() }))
+    await hideSearch()
+  }
+  await sleep(550)
+  const labelCount = await search('label', 'done')
+  check('链接显示文字可以替换且保留目标及换行', labelCount === '1/1' && await doc() === hiddenSearch.replace('[label]', '[done]'), await doc())
+  await hideSearch(); await key('z', MOD)
+  check('链接文字替换一步撤销且保留隐藏结构', await doc() === hiddenSearch, await doc())
+  // 特殊字符的输入与查找替换使用真实搜索面板，在每套主题下都覆盖同一组旧问题。
+  for (const theme of themes) {
+    await setTheme(theme)
+    await setDoc(replaceFixture)
+    await sleep(550)
+    const count = await search('x', '|')
+    const expected = replaceFixture.replace('正文 axb', '正文 a|b').replace('axb axb', `a${S}|b a${S}|b`).replace('`axb`', '`a|b`')
+    check(`${theme} 特殊字符替换保持普通格与代码格`, count === '1/4' && await doc() === expected && same(await rowCells(1), ['a|b a|b', 'a|b']), JSON.stringify({count,doc:await doc()}))
+    await hideSearch(); await key('z', MOD)
+    check(`${theme} 全部替换一步撤销`, await doc() === replaceFixture, await doc())
+    await key('z', MOD | 8)
+    check(`${theme} 全部替换重做保持分格`, await doc() === expected, await doc())
+    const visiblePipes = await search('|', S)
+    check(`${theme} 按显示文字替换竖线为反斜杠`, visiblePipes === '1/5' && same(await rowCells(1), [`a${S}b a${S}b`, `a${S}b`]) && same(await rowCells(2), [`a${S}b`, 'tail']), JSON.stringify({visiblePipes,doc:await doc()}))
+    await hideSearch()
+    await search(S, '')
+    check(`${theme} 查找删除反斜杠保持普通格和代码格`, same(await rowCells(1), ['ab ab', 'ab']) && same(await rowCells(2), ['ab', 'tail']), await doc())
+    await hideSearch()
+    const source = '|A|B|\n|---|---|\n|axb|`c|d`|\n'
+    await setDoc(source)
+    await cursor(source.indexOf('x') + 1)
+    await type('`')
+    check(`${theme} 新反引号不跨格配对且光标跟随输入`, await doc() === source.replace('x', 'x'+S+'`') && same(await rowCells(1), ['ax`b', 'c|d']) && await head() === (await doc()).indexOf('`b')+1, JSON.stringify({doc:await doc(),head:await head()}))
+    await key('z', MOD)
+    check(`${theme} 跨格反引号保护一步撤销`, await doc() === source, await doc())
+  }
+  await setTheme('elegant')
+  await setDoc(replaceFixture)
+  const replaceCount = await search('x', '|')
+  const replacedFixture = replaceFixture.replace('正文 axb', '正文 a|b').replace('axb axb', `a${S}|b a${S}|b`).replace('`axb`', '`a|b`')
+  check('查找替换覆盖正文、同格多匹配和代码格', replaceCount === '1/4' && await doc() === replacedFixture && same(await rowCells(1), ['a|b a|b', 'a|b']), JSON.stringify([replaceCount, await doc(), await rowCells(1)]))
+  await hideSearch(); await key('z', MOD)
+  check('全部替换只需一步撤销', await doc() === replaceFixture, await doc())
+  await key('z', MOD | 8)
+  check('全部替换重做仍保留分格', await doc() === replacedFixture, await doc())
+  const pipeCount = await search('|', 'X')
+  check('搜索竖线排除格线，替换隐藏转义后的文字', pipeCount === '1/5' && await evaluate(`document.querySelector('.search-count').textContent`) === '0/0' && same(await rowCells(1), ['aXb aXb', 'aXb']) && same(await rowCells(2), ['aXb', 'tail']), JSON.stringify([pipeCount, await doc()]))
+  await hideSearch()
+  await setDoc(replaceFixture)
+  await search('a|b', 'done', false)
+  check('可按显示文字找到转义竖线所在格并单次替换', same(await rowCells(2), ['done', 'tail']) && (await doc()).includes('| done | tail |'), await doc())
+  await hideSearch()
+  await setDoc('|A|B|\n|---|---|\n|aaa|`a'+S+'|b`|\n')
+  await search('aa', 'X')
+  check('相互重叠的查找结果只替换一次', (await doc()).includes('|Xa|'), await doc())
+  await hideSearch()
+  await search(S, '')
+  check('查找删除代码反斜杠保持代码和分格', same(await rowCells(1), ['Xa','a|b']), await doc())
+  await hideSearch()
+  const ticking = '|A|B|\n|---|---|\n|axb|`c|d`|\n'
+  await setDoc(ticking)
+  await cursor(ticking.indexOf('x') + 1)
+  await type('`')
+  check('输入反引号不会与隔壁代码格配对', await doc() === ticking.replace('x', 'x'+S+'`') && same(await rowCells(1), ['ax`b', 'c|d']), JSON.stringify([await doc(), await rowCells(1)]))
+  check('反引号保护后光标仍跟在输入文字后', await head() === (await doc()).indexOf('`b') + 1, await head())
+  await key('z', MOD)
+  check('跨格反引号保护与输入一步撤销', await doc() === ticking, await doc())
+  await setDoc('İ\n\n|A|B|\n|---|---|\n|x|`a|b`|\n')
+  await evaluate(`document.getElementById('source-toggle-btn').click()`)
+  await search('x', '|')
+  check('源码模式替换直接修改原文', await evaluate(`document.getElementById('source-editor').value.includes('|||')`), await evaluate(`document.getElementById('source-editor').value`))
+  await hideSearch()
+  await evaluate(`document.getElementById('source-toggle-btn').click()`)
+  const wordSource = '| A | B |\n|---|---|\n' + [0,1,2,3].map(count => '| `a'+S.repeat(count)+'|b` | end |').join('\n') + '\n\n' +
+    '> 引用前文\n>\n> - | A | B |\n>   |---|---|\n>   | [link](https://example.com/`a|b`) | END |\n>   | <span title="`c|d`">text</span> | html-end |\n>   | [引用标签][reference] | ref-end |\n>\n> 引用后文\n\n[reference]: https://example.com/reference\n'
+  const wordPath = join(dir, 'code-pipes.docx')
+  await mainEval(`(async () => {
+    const require = process.getBuiltinModule('module').createRequire(process.cwd()+'/package.json')
+    const {markdownToDocx} = require('./dist/main/chunks/docx-export.js')
+    const bytes = await markdownToDocx({content:${JSON.stringify(wordSource)},sourcePath:null})
+    process.getBuiltinModule('fs').writeFileSync(${JSON.stringify(wordPath)},bytes)
+  })()`)
+  const docxRequire = createRequire(createRequire(import.meta.url).resolve('docx'))
+  const wordZip = await docxRequire('jszip').loadAsync(readFileSync(wordPath))
+  const wordXML = await wordZip.file('word/document.xml').async('string')
+  const wordRows = [...wordXML.matchAll(/<w:tr[ >][\s\S]*?<\/w:tr>/g)].map(row => [...row[0].matchAll(/<w:tc[ >]([\s\S]*?)<\/w:tc>/g)].map(cell => [...cell[1].matchAll(/<w:t(?:\s[^>]*)?>(.*?)<\/w:t>/g)].map(text => text[1]).join('')))
+  check('真实 Word 文件保留代码反斜杠、竖线和两列', same(wordRows.slice(0, 5), [['A','B'], ...[0,1,2,3].map(count => ['a'+S.repeat(count)+'|b','end'])]), JSON.stringify(wordRows))
+  const wordRels = await wordZip.file('word/_rels/document.xml.rels').async('string')
+  const quoteParagraphs = [...wordXML.matchAll(/<w:p[ >][\s\S]*?<\/w:p>/g)].map(match => match[0]).filter(paragraph => /引用前文|引用后文/.test(paragraph))
+  check('真实 Word 导出引用内列表表格并保持链接和普通引用样式',
+    same(wordRows.slice(5), [['A','B'], ['link','END'], ['text','html-end'], ['引用标签','ref-end']]) && wordRels.includes('https://example.com/`a|b`') &&
+    quoteParagraphs.length === 2 && quoteParagraphs.every(paragraph => paragraph.includes('<w:pBdr>') && /<w:i[\s/>]/.test(paragraph)), JSON.stringify(wordRows))
+
+  const mathCell = `| A | B |\n|---|---|\n| $a${S}${S}b$ | c |\n`
+  await setDoc(mathCell)
+  await cursor(mathCell.indexOf('b$'))
+  await key('Backspace')
+  check('公式里的双反斜杠逐个删除', await doc() === mathCell.replace(`${S}${S}b`, `${S}b`), await doc())
+
+  const movable = '|A|B|\n|---|---|\n|x|y|\n|p|q|\n'
+  for (const [direction, word] of [['ArrowDown', 'x'], ['ArrowUp', 'p']]) {
+    await setDoc(movable)
+    await select(word)
+    await key(direction, 1)
+    check(`Alt+${direction}移动整行保留表格结构`, await doc() === '|A|B|\n|---|---|\n|p|q|\n|x|y|\n' && same(await rowCells(1), ['p', 'q']) && same(await rowCells(2), ['x', 'y']), await doc())
+    await key('z', MOD)
+    check(`Alt+${direction}移动整行一步撤销`, await doc() === movable, await doc())
+  }
+  const borderless = 'A|B\n---|---\nx|y\np|q\n'
+  await setDoc(borderless)
+  await select('x')
+  await key('ArrowDown', 1 | 8)
+  check('无边框表格复制整行保留换行和分格', await doc() === 'A|B\n---|---\nx|y\nx|y\np|q\n' && same(await rowCells(2), ['x', 'y']), await doc())
+  await key('z', MOD)
+  check('复制整行一步撤销', await doc() === borderless, await doc())
+
+  await setDoc(compactSlash)
+  const composeAt = compactSlash.indexOf('x') + 1
+  const composingSelection = await evaluate(`(() => {
+    const S = v.state.selection.constructor
+    const tr = v.state.update({changes:{from:${composeAt},insert:'中'},selection:S.create([S.cursor(${composeAt + 1},1)]),userEvent:'input.type.compose'})
+    return { head:tr.newSelection.main.head, assoc:tr.newSelection.main.assoc }
+  })()`)
+  check('组合事务保留输入法给定的光标朝向', same(composingSelection, { head: composeAt + 1, assoc: 1 }), JSON.stringify(composingSelection))
 
   // 紧凑表格的格尾和右侧竖线是同一个位置：各种方式把光标放到格尾再输入，字都留在这一格
   const tight = '|A|B|\n|---|---|\n|xy|zw|\n'
@@ -633,7 +915,7 @@ try {
   await setTheme(await evaluate(`localStorage.getItem('colamd-theme') || 'elegant'`))
   await sleep(300)
   const refreshed = await fontWidths()
-  check('只换字体族后列宽按新字体重算', georgia.columns[1] > georgia.columns[0] * 2 && Math.abs(menlo.columns[0] - menlo.columns[1]) <= 2, JSON.stringify({ georgia, menlo }))
+  check('比例字体的宽字符列更宽，等宽字体两列等宽', georgia.columns[1] > georgia.columns[0] + 2 && Math.abs(menlo.columns[0] - menlo.columns[1]) <= 2, JSON.stringify({ georgia, menlo }))
   check('只换字体族后的布局与重新换主题一致', same(menlo, refreshed), JSON.stringify({ menlo, refreshed }))
   await setFont('', 0)
   await setDoc(fixture)
@@ -744,29 +1026,70 @@ try {
   await select('text')
   await key('Enter')
   await key('Enter')
-  check('表格末尾空行按 Enter 回到正文', await doc() === noNewline + '\n\n', await doc())
+  const paragraphFocused = () => evaluate(`document.activeElement?.classList.contains('cm-md-table-paragraph-input') && document.activeElement.getBoundingClientRect().height > 0`)
+  check('删除表格末尾空行后先落到临时正文位置', await doc() === noNewline && await paragraphFocused(), await doc())
   await type('正文')
   check('无结尾换行的表格后也能继续写作', await doc() === noNewline + '\n\n正文', await doc())
-  // 文档以表格开头或结尾时，外面没有能落脚的行：方向键离开要补出空段落，否则光标被夹回格子里
+  // 文档边界的方向键只创建临时可见落点；首次输入与必要空行是同一笔实际编辑。
   await setDoc(noNewline)
   await sleep(600)
   await select('value', 5)
   await key('ArrowDown')
-  check('文末表格按下方向键离开并留出空行', await doc() === noNewline + '\n\n' && await head() === noNewline.length + 2, await doc())
+  check('文末表格按下方向键显示正文光标且不改原文', await doc() === noNewline && await paragraphFocused(), await doc())
   await type('正文')
   check('离开文末表格后输入的是正文', await doc() === noNewline + '\n\n正文' && await evaluate(`document.querySelectorAll('.cm-md-table-row').length`) === 2, await doc())
+  await key('z', MOD)
+  check('首次正文输入与必要空行一步撤销并恢复表外光标', await doc() === noNewline && await paragraphFocused(), await doc())
+  await key('z', MOD | 8)
+  check('首次正文输入与必要空行一步重做', await doc() === noNewline + '\n\n正文', await doc())
+  await key('z', MOD)
+  await type('继续')
+  check('表外正文撤销后继续输入仍是正文', await doc() === noNewline + '\n\n继续', await doc())
   await setDoc(noNewline + '\n')
   await sleep(600)
   await select('value', 5)
   await key('ArrowRight')
-  check('结尾只有换行时右方向键离开表格补一个空行', await doc() === noNewline + '\n\n' && await head() === noNewline.length + 2, await doc())
+  check('结尾已有换行时向右离开仍不补空行', await doc() === noNewline + '\n' && await paragraphFocused(), await doc())
+  await key('Escape')
+  check('取消临时正文落点保持原文并返回表格', await doc() === noNewline + '\n' && !await evaluate(`!!document.querySelector('.cm-md-table-paragraph-input')`) && await head() === noNewline.indexOf('value') + 5, await doc())
   await setDoc(noNewline + '\n')
   await sleep(600)
   await select('A')
   await key('ArrowUp')
-  check('文首表格按上方向键离开并留出空行', await doc() === '\n\n' + noNewline + '\n' && await head() === 0, await doc())
+  check('文首表格按上方向键只显示临时段落', await doc() === noNewline + '\n' && await paragraphFocused(), await doc())
+  await paste('正文\n第二行')
+  check('文首临时段落粘贴确认后才创建正文', await doc() === '正文\n第二行\n\n' + noNewline + '\n', await doc())
   await key('z', MOD)
-  check('离开表格补的空行可撤销', await doc() === noNewline + '\n', await doc())
+  check('文首正文粘贴及补行一步撤销并恢复表外光标', await doc() === noNewline + '\n' && await paragraphFocused(), await doc())
+  await type('文首继续')
+  check('文首正文撤销后继续输入不进入表头', await doc() === '文首继续\n\n' + noNewline + '\n', await doc())
+  await key('z', MOD)
+  await select('value', 5)
+  await key('ArrowDown')
+  await send('Input.imeSetComposition', { text: 'zhong', selectionStart: 5, selectionEnd: 5 })
+  check('表外临时段落的输入法预编辑不改文档', await doc() === noNewline + '\n', await doc())
+  await send('Input.imeSetComposition', { text: '', selectionStart: 0, selectionEnd: 0 })
+  check('取消表外输入法预编辑不创建段落', await doc() === noNewline + '\n', await doc())
+  await clickCell(1, 0)
+  check('点击表格取消临时段落且不改文档', await doc() === noNewline + '\n' && !await evaluate(`!!document.querySelector('.cm-md-table-paragraph-input')`), await doc())
+  await select('value', 5)
+  await key('ArrowDown')
+  await evaluate(`v.setState(v.state)`)
+  await sleep(50)
+  check('恢复标签状态取消临时段落并返回原单元格', await doc() === noNewline + '\n' && !await evaluate(`!!document.querySelector('.cm-md-table-paragraph-input')`) && await head() === noNewline.indexOf('value') + 5, await doc())
+  // 应用的 restoreEditorState 在 setState 后会恢复编辑器焦点。
+  await evaluate(`v.focus()`)
+  await type('X')
+  check('恢复标签状态后继续输入不落入隐藏源码格', await doc() === (noNewline + '\n').replace('value', 'valueX'), await doc())
+  await setDoc(noNewline)
+  await select('value', 5)
+  await key('ArrowDown')
+  await evaluate(`document.getElementById('source-toggle-btn').focus()`)
+  await sleep(50)
+  check('临时段落失焦取消后保留安全格内光标', await doc() === noNewline && !await evaluate(`!!document.querySelector('.cm-md-table-paragraph-input')`) && await head() === noNewline.indexOf('value') + 5, await doc())
+  await evaluate(`v.focus()`)
+  await type('X')
+  check('临时段落失焦后继续输入不落入隐藏源码格', await doc() === noNewline.replace('value', 'valueX'), await doc())
   const longTable = '# 长表格\n\n| A | B |\n|---|---|\n' + Array.from({length:1200}, (_,i)=>`| row-${i} | 内容-${i} |`).join('\n') + '\n'
   await setDoc(longTable)
   await evaluate(`v.scrollDOM.scrollTop=v.scrollDOM.scrollHeight`)
@@ -777,11 +1100,69 @@ try {
   await evaluate(`v.scrollDOM.scrollTop=0`)
   for (let i=0;i<60 && !await evaluate(`!!document.querySelector('.cm-md-table-header')`);i++) await sleep(50)
   check('长表格往返滚动不改写原文', await doc() === longTable)
+
+  // 内容放得下后均分余量；编辑后固定的列宽不能因访问另一张表而丢失。
+  const settleReviewLayout = condition => evaluate(`(async () => {
+    let previous = '', stable = 0
+    for (let frame = 0; frame < 120; frame++) {
+      await new Promise(resolve => requestAnimationFrame(resolve))
+      const current = JSON.stringify([...v.contentDOM.querySelectorAll('.cm-md-table-header .cm-md-table-cell')].map(cell => cell.getBoundingClientRect().width))
+      stable = (${condition}) && current === previous ? stable + 1 : 0
+      if (stable >= 3) return
+      previous = current
+    }
+    throw new Error('布局未在预期视口收敛')
+  })()`)
+  const reviewColumns = () => evaluate(`[...v.contentDOM.querySelectorAll('[data-table-from="0"] .cm-md-table-header .cm-md-table-cell')].map(cell => cell.getBoundingClientRect().width)`)
+  await setDoc('| A | B |\n|---|---|\n| [link](https://example.com/`a|b`) | END |\n')
+  await settleReviewLayout(`v.contentDOM.querySelectorAll('[data-table-from="0"] .cm-md-table-header .cm-md-table-cell').length === 2`)
+  const shortColumns = await reviewColumns()
+  check('短链接与短文字不会把几像素内容差距放大为悬殊列宽', Math.abs(shortColumns[0] - shortColumns[1]) <= (shortColumns[0] + shortColumns[1]) * 0.025, JSON.stringify(shortColumns))
+  const reviewedLayout = '| A | B |\n|---|---|\n| a | ' + 'W'.repeat(60) + ' |\n\n' + '两张表之间的正文。\n\n'.repeat(160) + '| X | Y |\n|---|---|\n| end | end |\n'
+  await setDoc(reviewedLayout)
+  await settleReviewLayout(`v.contentDOM.querySelectorAll('[data-table-from="0"] .cm-md-table-header .cm-md-table-cell').length === 2`)
+  const beforeReviewedEdit = await reviewColumns()
+  const reviewedCache = await evaluate(`(async () => {
+    const first = v.state.doc.toString().indexOf('| a') + 3
+    for (let step = 0; step < 120; step++) {
+      v.dispatch({ changes: { from: first + step, insert: 'W' }, selection: { anchor: first + step + 1 }, userEvent: 'input.type' })
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+    }
+    const plugin = v.plugins.map(instance => instance.value).find(value => value?.metrics instanceof Map && value?.layouts instanceof Map)
+    return { entries: plugin.metrics.size, keyCharacters: [...plugin.metrics.keys()].reduce((total, key) => total + key.length, 0) }
+  })()`)
+  const afterReviewedEdit = await reviewColumns()
+  check('同格增量输入不累计历史全文度量', reviewedCache.entries <= 4, JSON.stringify(reviewedCache))
+  check('增量输入时各列保持初始宽度', beforeReviewedEdit.every((width, column) => Math.abs(width - afterReviewedEdit[column]) < 1), JSON.stringify({ beforeReviewedEdit, afterReviewedEdit }))
+  const editedReviewedLayout = await doc()
+  await evaluate(`v.dispatch({ selection: { anchor: v.state.doc.length } }); v.scrollDOM.scrollTop = v.scrollDOM.scrollHeight`)
+  await settleReviewLayout(`!!v.contentDOM.querySelector('.cm-md-table-row') && !v.contentDOM.querySelector('[data-table-from="0"] .cm-md-table-row')`)
+  check('离开视口后保留当前文档表格的列宽CSS', await evaluate(`[...v.dom.querySelectorAll('style')].some(style => style.textContent.includes('[data-table-from="0"] .cm-md-table-cell'))`))
+  await evaluate(`v.scrollDOM.scrollTop = 0`)
+  await settleReviewLayout(`!!v.contentDOM.querySelector('[data-table-from="0"] .cm-md-table-header')`)
+  const returnedReviewedColumns = await reviewColumns()
+  check('编辑后访问另一张表再返回保持列宽与原文', afterReviewedEdit.every((width, column) => Math.abs(width - returnedReviewedColumns[column]) < 1) && await doc() === editedReviewedLayout, JSON.stringify({ afterReviewedEdit, returnedReviewedColumns }))
+
+  const openEndedTable = '| A | B |\n|---|---|\n| a | LAST' + 'W'.repeat(60)
+  await setDoc(openEndedTable)
+  await settleReviewLayout(`v.contentDOM.querySelectorAll('[data-table-from="0"] .cm-md-table-header .cm-md-table-cell').length === 2`)
+  const openEndedColumns = await reviewColumns()
+  await select('a', 1)
+  await type('W'.repeat(120))
+  await select('LAST' + 'W'.repeat(60), 64)
+  await key('ArrowDown')
+  const openEndedEdited = await doc()
+  check('省略尾竖线的表格也只导航不改文档', openEndedEdited === openEndedTable.replace('| a |', '| a' + 'W'.repeat(120) + ' |') && await paragraphFocused(), openEndedEdited)
+  await type('正文')
+  await settleReviewLayout(`!!v.contentDOM.querySelector('[data-table-from="0"] .cm-md-table-header')`)
+  const openEndedAfter = await reviewColumns()
+  check('省略尾竖线时首次表外输入不改变固定列宽', openEndedColumns.every((width, column) => Math.abs(width - openEndedAfter[column]) < 1) && await doc() === openEndedEdited + '\n\n正文', JSON.stringify({ openEndedColumns, openEndedAfter }))
+
   const scrolling = '| 场景 | 示例 | 备注 |\n|---|---|---|\n| 换行 | 第一行<br>第二行<br>第三行 | 说明 |\n| 长英文 | document_export_configuration_preview | 比较长的备注内容用于分配列宽 |\n\n' + '表格之间的正文。\n\n'.repeat(40)
     + '| 编号 | 地区 | 产品 | 数量 | 金额（元） | 备注 |\n| :---: | :---: | :--- | ---: | ---: | :--- |\n'
     + Array.from({ length: 160 }, (_, i) => `| ${i + 1} | 杭州 | 文档模板 | ${i + 8} | ${(i * 123.45).toFixed(2)} | ${i % 13 ? '可以直接修改' : '这是一段较长的备注，用于检查内容滚出视口时各列是否仍然保持原来的宽度。'} |`).join('\n')
     + '\n\n' + '表格之后的正文。\n\n'.repeat(40)
-  for (const theme of ['light', 'elegant', 'nord']) {
+  for (const theme of themes) {
     await setTheme(theme)
     await setDoc(scrolling)
     const widths = await evaluate(`(async () => {

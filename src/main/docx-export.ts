@@ -1,13 +1,7 @@
 import { nativeImage } from 'electron'
 import { basename, dirname, extname, isAbsolute, resolve } from 'path'
 import { fileURLToPath } from 'url'
-// 这三个必须在 package.json 里**直接声明**。
-// 曾经它们只是 @milkdown/* 的传递依赖，靠 npm 的依赖提升侥幸能 load：构建期发现不了
-// （主进程的依赖是外部化的，vite 不解析它们），一执行 npm install 删掉 milkdown，
-// Word 导出就会在运行时「模块找不到」（2026-10-06 换内核后的清理里查出来的）。
-import { unified } from 'unified'
-import remarkParse from 'remark-parse'
-import remarkGfm from 'remark-gfm'
+import { parseMarkdownForWord, type MarkdownNode } from './markdown-for-word'
 import {
   Document,
   ExternalHyperlink,
@@ -22,17 +16,6 @@ import {
   WidthType,
   type ParagraphChild,
 } from 'docx'
-
-interface MarkdownNode {
-  type: string
-  value?: string
-  depth?: number
-  ordered?: boolean
-  start?: number
-  url?: string
-  alt?: string
-  children?: MarkdownNode[]
-}
 
 export interface DocxExportInput {
   content: string
@@ -131,6 +114,10 @@ function tableForNode(node: MarkdownNode): Table {
   })
 }
 
+function containsTable(node: MarkdownNode): boolean {
+  return node.type === 'table' || !!node.children?.some(containsTable)
+}
+
 function blockNodes(nodes: MarkdownNode[] | undefined, sourcePath: string | null, images?: Record<string, string>, listDepth = 0): Array<Paragraph | Table> {
   if (!nodes) return []
   const output: Array<Paragraph | Table> = []
@@ -143,9 +130,9 @@ function blockNodes(nodes: MarkdownNode[] | undefined, sourcePath: string | null
     } else if (node.type === 'image') {
       output.push(imageParagraph(node, sourcePath, images))
     } else if (node.type === 'blockquote') {
-      if (node.children?.some(child => child.type === 'table')) {
+      if (node.children?.some(containsTable)) {
         for (const child of node.children) {
-          if (child.type === 'table') output.push(tableForNode(child))
+          if (containsTable(child)) output.push(...blockNodes([child], sourcePath, images, listDepth))
           else output.push(...blockNodes([{ ...node, children: [child] }], sourcePath, images, listDepth))
         }
         continue
@@ -189,7 +176,7 @@ function blockNodes(nodes: MarkdownNode[] | undefined, sourcePath: string | null
 }
 
 export async function markdownToDocx(input: DocxExportInput): Promise<Buffer> {
-  const tree = unified().use(remarkParse).use(remarkGfm).parse(input.content) as MarkdownNode
+  const tree = parseMarkdownForWord(input.content)
   const document = new Document({
     creator: 'ColaMD',
     title: input.sourcePath ? basename(input.sourcePath, extname(input.sourcePath)) : 'Untitled',

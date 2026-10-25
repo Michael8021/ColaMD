@@ -657,25 +657,29 @@ function collectFrontmatter(state: EditorState, ranges: DecorationRange[], front
  * 文字上带 `data-href`，而不是把整段换成 `<a>` widget：换成 widget 的话，链接文字里的
  * 加粗、行内代码就全没了。点击行为在 editor.ts 里，它认 `data-href`。
  */
+/** 链接里实际显示的文字范围，渲染和文字检索共同使用。 */
+export function linkTextRange(state: EditorState, node: SyntaxNode): Range | null {
+  const url = node.getChild('URL')
+  if (!url) return null
+  const cut = state.sliceDoc(node.from, url.from).lastIndexOf('](')
+  return cut > 1 ? { from: node.from + 1, to: node.from + cut } : null
+}
+
 function collectLinks(state: EditorState, ranges: DecorationRange[], front: Range | null): void {
   iterateContent(state, front, (node) => {
     if (node.name !== 'Link') return
     // 引用式链接 `[文字][引用]` 和脚注 `[^note]` 都没有 URL 子节点：
     // 前者保持原样，后者交给脚注那一节画。
-    const url = node.node.getChild('URL')
-    if (!url) return false
+    const text = linkTextRange(state, node.node)
+    if (!text) return false
     if (isActiveRange(state, node.from, node.to)) return false
-    const head = state.doc.sliceString(node.from, url.from)
-    const cut = head.lastIndexOf('](')
-    if (cut < 1) return false
-    const textTo = node.from + cut
-    if (textTo <= node.from + 1) return false
+    const url = node.node.getChild('URL')!
     const href = state.doc.sliceString(url.from, url.to)
-    ranges.push({ from: node.from, to: node.from + 1, deco: hide(node.from, node.from + 1) })
-    ranges.push({ from: textTo, to: node.to, deco: hide(textTo, node.to) })
+    ranges.push({ from: node.from, to: text.from, deco: hide(node.from, text.from) })
+    ranges.push({ from: text.to, to: node.to, deco: hide(text.to, node.to) })
     ranges.push({
-      from: node.from + 1,
-      to: textTo,
+      from: text.from,
+      to: text.to,
       deco: MARK({ class: 'cm-md-link', attributes: { 'data-href': href } }),
     })
     return false

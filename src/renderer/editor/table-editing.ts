@@ -1,10 +1,13 @@
-import { Annotation, EditorSelection, EditorState, Prec, StateEffect, StateField, Transaction, type ChangeSpec, type Line, type Range, type TransactionSpec } from '@codemirror/state'
-import { BlockWrapper, Decoration, EditorView, ViewPlugin, WidgetType, keymap, type Rect, type ViewUpdate } from '@codemirror/view'
+import { Annotation, ChangeSet, Compartment, EditorSelection, EditorState, Prec, StateEffect, StateField, Transaction, type ChangeSpec, type Line, type Range, type TransactionSpec } from '@codemirror/state'
+import { BlockWrapper, Decoration, EditorView, ViewPlugin, WidgetType, keymap, type DecorationSet, type Rect, type ViewUpdate } from '@codemirror/view'
 import { syntaxTree } from '@codemirror/language'
-import type { SyntaxNode } from '@lezer/common'
-import { frontmatterRange } from './math-scan'
+import { invertedEffects, isolateHistory, redo, selectAll, undo } from '@codemirror/commands'
+import type { SyntaxNode, Tree } from '@lezer/common'
+import { frontmatterRange, scanMath } from './math-scan'
 import { isChinese } from '../ui-language'
-import { livePreviewField } from './live-preview'
+import { linkTextRange, livePreviewField } from './live-preview'
+import { unpairedBackticks, tableCodeSpans, tablePipes } from '../../shared/markdown-tables'
+import { markdownParser } from './state'
 
 export interface TableCell {
   /** 含两侧竖线的整格 */
@@ -40,16 +43,18 @@ const tableCache = new WeakMap<EditorState['doc'], Map<string, MarkdownTable>>()
 
 /** 列宽按占比写：打印时纸比窗口窄、脚本不会重算，按占比才放得下。wrapColumns 是数字也要拆行的列 */
 interface TableLayout { width: number; columns: number[]; wrapColumns: number[] }
+interface TableLayoutSnapshot extends TableLayout {
+  length: number
+  structure: string
+  boundaries: number[]
+}
 
 const sum = (values: number[]) => values.reduce((total, value) => total + value, 0)
 
 function readRow(state: EditorState, node: SyntaxNode): TableRow {
   const text = state.sliceDoc(node.from, node.to)
-  const pipes: number[] = []
-  for (let i = 0; i < text.length; i++) {
-    if (text[i] === '\\') i++
-    else if (text[i] === '|') pipes.push(i)
-  }
+  const pipes = node.name === 'TableDelimiter' ? tablePipes(text)
+    : node.getChildren('TableDelimiter').map(marker => marker.from - node.from)
   const leading = pipes[0] === 0
   const trailing = pipes.at(-1) === text.length - 1
   const dividers = pipes.slice(leading ? 1 : 0, trailing ? -1 : undefined)
@@ -150,23 +155,128 @@ class EmptyTableCell extends WidgetType {
     cell.appendChild(input)
     return cell
   }
+  // 光标是格里一行字的高度，不是整格：整格的高度由同一行最高的那一格决定
+  coordsAt(dom: HTMLElement): Rect {
+    const rect = (dom.querySelector('.cm-md-table-input') ?? dom).getBoundingClientRect()
+    const x = this.align === 'center' ? (rect.left + rect.right) / 2 : this.align === 'right' ? rect.right : rect.left
+    return { left: x, right: x, top: rect.top, bottom: rect.bottom }
+  }
   ignoreEvent(event: Event): boolean {
     return (event instanceof KeyboardEvent && event.isComposing) || (event.type !== 'mousedown' && event.type !== 'keydown' && event.type !== 'paste')
   }
 }
 
-/** 位置是否在格子的行内代码里：代码里的 `\\`、`<br>` 原样显示，GFM 只在表格这一层把 `\|` 还原成竖线 */
-function inCode(state: EditorState, cell: TableCell): (pos: number) => boolean {
-  const code: { from: number; to: number }[] = []
-  syntaxTree(state).iterate({ from: cell.start, to: cell.end, enter: node => { if (node.name === 'InlineCode') code.push({ from: node.from, to: node.to }) } })
-  return pos => code.some(node => pos > node.from && pos < node.to)
+interface TableParagraph {
+  at: number
+  side: -1 | 1
+  gap: string
+  returnTo: number
 }
 
-/** 格子里只显示后一个字的转义 `\|`、`\\`：返回这些反斜杠的位置 */
-function hiddenEscapes(state: EditorState, cell: TableCell, code = inCode(state, cell)): number[] {
-  return [...state.sliceDoc(cell.start, cell.end).matchAll(/\\[\\|]/g)]
+/** 文档边界外的临时输入位置。只有确认输入后才把段落写进源码。 */
+class TableParagraphInput extends WidgetType {
+  constructor(readonly paragraph: TableParagraph, readonly allowInput: boolean) { super() }
+  eq(other: TableParagraphInput): boolean { return this.paragraph === other.paragraph && this.allowInput === other.allowInput }
+  toDOM(view: EditorView): HTMLElement {
+    const block = document.createElement('div')
+    block.className = 'cm-md-table-paragraph'
+    const input = document.createElement('div')
+    input.className = 'cm-md-table-paragraph-input'
+    input.contentEditable = String(this.allowInput)
+    input.tabIndex = -1
+    input.setAttribute('role', 'textbox')
+    input.setAttribute('aria-label', isChinese() ? '段落' : 'Paragraph')
+    input.setAttribute('aria-readonly', String(!this.allowInput))
+    let composing = false
+    const active = () => input.isConnected && pendingParagraph(view.state) === this.paragraph
+    const commit = (text: string) => {
+      if (text && active() && insertParagraphText(view, text)) view.focus()
+    }
+    input.addEventListener('compositionstart', () => { composing = true })
+    input.addEventListener('compositionend', event => {
+      composing = false
+      if (event.data) commit(input.textContent || event.data)
+      else input.textContent = ''
+    })
+    input.addEventListener('input', event => {
+      if (!composing && !(event as InputEvent).isComposing) commit(input.textContent ?? '')
+    })
+    input.addEventListener('beforeinput', event => {
+      if (!this.allowInput) event.preventDefault()
+    })
+    input.addEventListener('paste', event => {
+      event.preventDefault()
+      commit(event.clipboardData?.getData('text/plain') ?? '')
+    })
+    input.addEventListener('blur', () => {
+      // DOM 可能正随 setState 更新而移除；等本轮更新结束后再处理真正的失焦。
+      queueMicrotask(() => {
+        if (active() && document.activeElement !== input) view.dispatch({ selection: { anchor: this.paragraph.returnTo }, effects: setTableParagraph.of(null) })
+      })
+    })
+    input.addEventListener('keydown', event => {
+      if (event.isComposing || composing) return
+      if ((event.metaKey || event.ctrlKey) && ['a', 'z'].includes(event.key.toLowerCase())) {
+        event.preventDefault()
+        event.stopPropagation()
+        if (event.key.toLowerCase() === 'a') {
+          returnFromParagraph(view, 0)
+          selectAll(view)
+        } else if (!view.state.readOnly && view.state.facet(EditorView.editable)) {
+          if ((event.shiftKey ? redo : undo)(view) && !pendingParagraph(view.state)) view.focus()
+        }
+        return
+      }
+      const direction = ['ArrowLeft', 'ArrowUp', 'Backspace'].includes(event.key) ? -1
+        : ['ArrowRight', 'ArrowDown', 'Delete'].includes(event.key) ? 1 : 0
+      if (direction || event.key === 'Escape' || event.key === 'Tab' || event.key === 'Enter') {
+        event.preventDefault()
+        event.stopPropagation()
+        if (event.key === 'Enter') commit('\n')
+        else returnFromParagraph(view, direction || (event.key === 'Tab' ? event.shiftKey ? -1 : 1 : 0))
+      }
+    })
+    block.appendChild(input)
+    return block
+  }
+  coordsAt(dom: HTMLElement): Rect {
+    const rect = dom.getBoundingClientRect()
+    return { left: rect.left, right: rect.left, top: rect.top, bottom: rect.bottom }
+  }
+  ignoreEvent(): boolean { return true }
+}
+
+function cellSyntax(tree: Tree, cell: TableCell): SyntaxNode | null {
+  let node: SyntaxNode | null = tree.resolveInner(cell.start, 1)
+  while (node && node.name !== 'TableCell' && node.from >= cell.left && node.to <= cell.right) node = node.parent
+  return node?.name === 'TableCell' ? node : null
+}
+
+/** 代码、公式里的反斜杠原样保留。直接定位当前格的子树，避免每格重扫整张表。 */
+function inVerbatim(state: EditorState, cell: TableCell, tree = syntaxTree(state)): (pos: number) => boolean {
+  const code: { from: number; to: number }[] = []
+  const excluded: { from: number; to: number }[] = []
+  cellSyntax(tree, cell)?.cursor().iterate(node => {
+    if (node.name === 'InlineCode') code.push({ from: node.from, to: node.to })
+    if (node.name === 'InlineCode' || node.name === 'HTMLTag') excluded.push({ from: node.from - cell.start, to: node.to - cell.start })
+  })
+  const math = scanMath(state.sliceDoc(cell.start, cell.end), excluded)
+    .map(range => ({ from: cell.start + range.from, to: cell.start + range.to }))
+  const ranges = [...code, ...math]
+  return pos => ranges.some(node => pos > node.from && pos < node.to)
+}
+
+/** 格子里只显示后一个字的转义（竖线、反斜杠、字面反引号）：返回隐藏的反斜杠位置。 */
+function hiddenEscapes(state: EditorState, cell: TableCell, verbatim = inVerbatim(state, cell)): number[] {
+  const code = tableCodeSpans(state.sliceDoc(cell.start, cell.end))
+  let span = 0
+  return [...state.sliceDoc(cell.start, cell.end).matchAll(/\\[\\|`]/g)]
     .map(match => cell.start + match.index!)
-    .filter(pos => state.sliceDoc(pos + 1, pos + 2) === '|' || !code(pos))
+    .filter(pos => {
+      while (span < code.length && pos >= cell.start + code[span].to) span++
+      return !(code[span] && pos >= cell.start + code[span].from) &&
+        (state.sliceDoc(pos + 1, pos + 2) === '|' || !verbatim(pos))
+    })
 }
 
 type DecorationRange = { from: number; to: number; deco: Decoration }
@@ -189,7 +299,8 @@ function tableWrappers(state: EditorState) {
     state.field(livePreviewField).between(first, first, (_from, _to, deco) => {
       classes.push(...(deco.spec.class ?? '').split(' ').filter((name: string) => name.startsWith('cm-md-page-') || name === 'cm-md-blockquote' || /^cm-md-li(?:-\d+)?$/.test(name)))
     })
-    wrappers.push(BlockWrapper.create({ tagName: 'div', attributes: { class: `cm-md-table-widget ${classes.join(' ')}`, 'data-table-from': String(node.from), role: 'table' } }).range(first, node.to))
+    // wrapper 按块起点归属；终点取末行起点，文末临时段落不属于表格。
+    wrappers.push(BlockWrapper.create({ tagName: 'div', attributes: { class: `cm-md-table-widget ${classes.join(' ')}`, 'data-table-from': String(node.from), role: 'table' } }).range(first, state.doc.lineAt(node.to).from))
   })
   return BlockWrapper.set(wrappers, true)
 }
@@ -287,6 +398,18 @@ const tableField = StateField.define<ReturnType<typeof tableDecorations>>({
 })
 
 let tableLayoutId = 0
+const tableGeometry = new Compartment()
+const tableGeometryTheme = EditorView.theme({})
+const tableGeometryUpdate = Annotation.define<boolean>()
+
+function tableLayoutSnapshot(table: MarkdownTable, layout: TableLayout): TableLayoutSnapshot {
+  return {
+    width: layout.width, columns: layout.columns, wrapColumns: layout.wrapColumns,
+    length: table.to - table.from,
+    structure: `${table.align.join(',')}/${table.rows.map(row => row.cells.length).join(',')}`,
+    boundaries: table.rows.flatMap(row => row.cells.flatMap(cell => [cell.left - table.from, cell.right - table.from])),
+  }
+}
 
 const tableLayout = ViewPlugin.fromClass(class {
   private readonly id = String(++tableLayoutId)
@@ -294,7 +417,7 @@ const tableLayout = ViewPlugin.fromClass(class {
   private readonly measure = document.createElement('div')
   private readonly canvas = document.createElement('canvas').getContext('2d')!
   private readonly metrics = new Map<string, { min: number; max: number }>()
-  private readonly layouts = new WeakMap<MarkdownTable, TableLayout>()
+  private layouts = new Map<number, TableLayoutSnapshot>()
   private readonly rules = new Map<number, string>()
   private probes: { key: string; min: HTMLElement; max: HTMLElement }[] = []
   private signature = ''
@@ -309,9 +432,32 @@ const tableLayout = ViewPlugin.fromClass(class {
   }
 
   update(update: ViewUpdate): void {
-    const reconfigured = update.transactions.some(tr => tr.reconfigured)
+    const reconfigured = update.transactions.some(tr => tr.reconfigured && !tr.annotation(tableGeometryUpdate))
     if (reconfigured) this.signature = ''
-    if (update.docChanged) this.rules.clear()
+    if (update.docChanged) {
+      // 格内编辑只改变文字，沿用列宽；否则少一个字也会重分配整张表，把光标横向推走。
+      // 映射各格的边界，只有格线、行列和对齐都没变时才保留布局。
+      const retained = new Map<number, TableLayoutSnapshot>()
+      for (const [from, layout] of this.layouts) {
+        const mapped = update.changes.mapPos(from, -1)
+        if (!update.changes.touchesRange(from, from + layout.length)) {
+          retained.set(mapped, layout)
+          continue
+        }
+        const next = tableAt(update.state, mapped)
+        if (!next || next.from !== mapped) continue
+        const snapshot = tableLayoutSnapshot(next, layout)
+        if (snapshot.structure !== layout.structure || snapshot.boundaries.length !== layout.boundaries.length) continue
+        // 无尾竖线时末格与表末重合；按新表末判断插入属于格内续写还是表外正文。
+        const endAssoc = next.to === update.changes.mapPos(from + layout.length, -1) ? -1 : 1
+        if (layout.boundaries.every((pos, index) => {
+          const assoc = index % 2 ? (pos === layout.length ? endAssoc : 1) : -1
+          return update.changes.mapPos(from + pos, assoc) - mapped === snapshot.boundaries[index]
+        })) retained.set(mapped, snapshot)
+      }
+      this.layouts = retained
+      this.rules.clear()
+    }
     if (reconfigured || update.docChanged || update.viewportChanged || update.geometryChanged) this.schedule()
   }
 
@@ -348,12 +494,16 @@ const tableLayout = ViewPlugin.fromClass(class {
     this.view.requestMeasure({ key: this, read: view => {
       for (const probe of this.probes) this.metrics.set(probe.key, { min: probe.min.getBoundingClientRect().width, max: probe.max.getBoundingClientRect().width })
       const sample = view.contentDOM.querySelector<HTMLElement>('.cm-md-table-cell')
-      if (!sample) return null
+      if (!sample) {
+        this.metrics.clear()
+        return { doc: view.state.doc, layouts: [], pending: [] }
+      }
       const style = getComputedStyle(sample)
       const signature = `${document.body.className}:${style.fontFamily}:${style.fontSize}:${style.letterSpacing}:${style.paddingLeft}:${style.paddingRight}:${style.minWidth}:${view.defaultCharacterWidth}`
       if (signature !== this.signature) {
         this.signature = signature
         this.metrics.clear()
+        this.layouts.clear()
         this.rules.clear()
       }
       const pending = new Map<string, { cell: TableCell; header: boolean; font: string }>()
@@ -363,11 +513,26 @@ const tableLayout = ViewPlugin.fromClass(class {
         if (!table || tables.has(table)) return
         const wrapper = row.closest<HTMLElement>('.cm-md-table-widget')!
         const wrapperStyle = getComputedStyle(wrapper)
-        tables.set(table, wrapper.clientWidth - parseFloat(wrapperStyle.paddingLeft) - parseFloat(wrapperStyle.paddingRight))
+        const parent = wrapper.parentElement!
+        const parentStyle = getComputedStyle(parent)
+        // 新数字还没放开换行时会暂时撑宽 table，不能把溢出后的宽度当作可用空间。
+        const available = parent.clientWidth - parseFloat(parentStyle.paddingLeft) - parseFloat(parentStyle.paddingRight)
+          - parseFloat(wrapperStyle.borderLeftWidth) - parseFloat(wrapperStyle.borderRightWidth)
+        tables.set(table, Math.min(wrapper.clientWidth, available) - parseFloat(wrapperStyle.paddingLeft) - parseFloat(wrapperStyle.paddingRight))
       })
       const layouts: (TableLayout & { table: MarkdownTable })[] = []
+      // 列宽快照和规则属于当前文档；仅内容度量随视口释放，不保留旧语法表对象。
+      const usedMetrics = new Set<string>()
       for (const [table, width] of tables) {
-        const cached = this.layouts.get(table)
+        let cached = this.layouts.get(table.from)
+        if (cached && (cached.length !== table.to - table.from || !this.rules.has(table.from))) {
+          const current = tableLayoutSnapshot(table, cached)
+          const boundaries = cached.boundaries
+          if (current.structure !== cached.structure || current.boundaries.length !== boundaries.length || current.boundaries.some((pos, index) => pos !== boundaries[index])) {
+            this.layouts.delete(table.from)
+            cached = undefined
+          } else this.layouts.set(table.from, cached = current)
+        }
         if (cached?.width === width && this.rules.has(table.from)) continue
         const minimum = table.align.map(() => parseFloat(style.minWidth))
         const preferred = [...minimum]
@@ -377,6 +542,7 @@ const tableLayout = ViewPlugin.fromClass(class {
           const text = view.state.sliceDoc(cell.start, cell.end)
           const header = index === 0
           const key = `${header}:${text}`
+          usedMetrics.add(key)
           const font = `${header ? '600' : '400'} ${style.fontSize} ${style.fontFamily}`
           let metric = this.metrics.get(key)
           if (!metric && !/[\*_~`\[\]<>$\\&]/.test(text)) {
@@ -395,6 +561,11 @@ const tableLayout = ViewPlugin.fromClass(class {
           preferred[column] = Math.max(preferred[column], metric.max + padding)
         }))
         if (pending.size) continue
+        if (cached?.width === width) {
+          // 列宽不变，但新输入的数字仍可能超过这一列，需要独立更新换行规则。
+          layouts.push({ ...cached, table, wrapColumns: minimum.flatMap((value, column) => value > cached.columns[column] ? [column] : []) })
+          continue
+        }
         // 整段数字放不下时，从最宽的数字列起放开拆行，一样宽的一起放开，直到放得下；放开的列退到
         // 拆行下限，空余再按理想宽度分。表格不撑出正文，一样长的数字拆得一样，短金额能不拆就不拆
         const floor = [...minimum]
@@ -408,15 +579,20 @@ const tableLayout = ViewPlugin.fromClass(class {
         const free = Math.max(0, width - sum(floor))
         const flex = preferred.map((value, column) => value - floor[column])
         const total = sum(flex)
-        layouts.push({ table, width, wrapColumns, columns: floor.map((value, column) => value + free * (total ? flex[column] / total : 1 / floor.length)) })
+        // 放得下时先满足内容，再均分多余空间；只有空间不足时才按内容需求分配。
+        const columns = floor.map((value, column) => value + (free >= total
+          ? flex[column] + (free - total) / floor.length
+          : free * flex[column] / total))
+        layouts.push({ table, width, wrapColumns, columns })
       }
+      if (usedMetrics.size) for (const key of this.metrics.keys()) if (!usedMetrics.has(key)) this.metrics.delete(key)
       return { doc: view.state.doc, layouts, pending: [...pending].map(([key, value]) => ({ key, ...value })) }
     }, write: plan => {
       this.measure.replaceChildren()
       this.probes = []
       if (!plan || plan.doc !== this.view.state.doc) return
       for (const layout of plan.layouts) {
-        this.layouts.set(layout.table, layout)
+        this.layouts.set(layout.table.from, tableLayoutSnapshot(layout.table, layout))
         const table = `[data-table-layout="${this.id}"] [data-table-from="${layout.table.from}"]`
         const total = sum(layout.columns)
         const rules = layout.columns.map((width, column) => `${table} .cm-md-table-cell[data-column="${column}"]{width:${width / total * 100}%}`)
@@ -424,7 +600,16 @@ const tableLayout = ViewPlugin.fromClass(class {
         this.rules.set(layout.table.from, rules.join('\n'))
       }
       const css = [...this.rules.values()].join('\n')
-      if (this.style.textContent !== css) this.style.textContent = css
+      if (this.style.textContent !== css) {
+        this.style.textContent = css
+        // 列边界变化未必改变行高。通过公开的 theme 重测路径刷新光标和选区的坐标；
+        // 测量写阶段不能派发事务，等这一轮完成后再通知，不改动用户选区。
+        queueMicrotask(() => {
+          if (!this.style.isConnected) return
+          const theme = tableGeometry.get(this.view.state) === tableGeometryTheme ? [] : tableGeometryTheme
+          this.view.dispatch({ effects: tableGeometry.reconfigure(theme), annotations: tableGeometryUpdate.of(true) })
+        })
+      }
       for (const probe of plan.pending) {
         const row = document.createElement('div')
         row.className = `cm-md-table-row${probe.header ? ' cm-md-table-header' : ''}`
@@ -460,6 +645,9 @@ function tableAt(state: EditorState, pos: number): MarkdownTable | null {
 }
 
 const tableEdit = Annotation.define<boolean>()
+// 整行移动、复制和缩进修改的是结构，不能当作单元格文字重写。
+const cellEditEvents = ['input.type', 'input.paste', 'input.drop', 'delete', 'move.drop']
+const isCellEdit = (tr: Transaction) => cellEditEvents.some(event => tr.isUserEvent(event))
 const setVirtualCell = StateEffect.define<{ row: number; column: number }>()
 const virtualCell = StateField.define<{ row: number; column: number } | null>({
   create: () => null,
@@ -469,7 +657,136 @@ const virtualCell = StateField.define<{ row: number; column: number } | null>({
   },
 })
 
+const setTableParagraph = StateEffect.define<TableParagraph | null>({
+  map: (paragraph, changes) => paragraph && ({
+    ...paragraph,
+    at: changes.mapPos(paragraph.at, paragraph.side),
+    returnTo: changes.mapPos(paragraph.returnTo, -paragraph.side),
+  }),
+})
+
+// 只把真实输入事务中的落点切换带进历史，单纯导航没有可撤销的事件。
+const tableParagraphHistory = invertedEffects.of(tr => tr.docChanged && tr.effects.some(effect => effect.is(setTableParagraph))
+  ? [setTableParagraph.of(pendingParagraph(tr.startState))] : [])
+const tableParagraph = StateField.define<{ paragraph: TableParagraph | null; decorations: DecorationSet }>({
+  create: () => ({ paragraph: null, decorations: Decoration.none }),
+  update(value, tr) {
+    const effect = tr.effects.find(effect => effect.is(setTableParagraph))
+    const paragraph = effect ? effect.value : tr.docChanged || tr.selection ? null : value.paragraph
+    if (paragraph === value.paragraph && !tr.reconfigured) return value
+    return {
+      paragraph,
+      decorations: paragraph ? Decoration.set([Decoration.widget({
+        widget: new TableParagraphInput(paragraph, tr.state.facet(EditorView.editable) && !tr.state.readOnly),
+        block: true, side: paragraph.side,
+      }).range(paragraph.at)]) : Decoration.none,
+    }
+  },
+  provide: field => EditorView.decorations.from(field, value => value.decorations),
+})
+
+function pendingParagraph(state: EditorState): TableParagraph | null {
+  return state.field(tableParagraph, false)?.paragraph ?? null
+}
+
+// 标签恢复旧的状态快照时，不恢复曾经聚焦的临时 DOM 输入位置。
+const tableParagraphLifecycle = ViewPlugin.fromClass(class {
+  private destroyed = false
+  constructor(private readonly view: EditorView) {
+    const paragraph = pendingParagraph(view.state)
+    if (paragraph) queueMicrotask(() => {
+      if (!this.destroyed && pendingParagraph(view.state) === paragraph) view.dispatch({ selection: { anchor: paragraph.returnTo }, effects: setTableParagraph.of(null) })
+    })
+  }
+  update(update: ViewUpdate): void {
+    const paragraph = pendingParagraph(update.state)
+    if (update.docChanged && paragraph && paragraph !== pendingParagraph(update.startState)) queueMicrotask(() => {
+      if (!this.destroyed && pendingParagraph(this.view.state) === paragraph) focusParagraph(this.view)
+    })
+  }
+  destroy(): void { this.destroyed = true }
+})
+
+// 空格子没有可放光标的字，输入由格里的临时输入框接收。焦点留在编辑器本体时，原生光标只能
+// 放在替换部件之后，打的字会落进下一行，画出的光标也撑满整格。点击和方向键之外，删空格子、
+// 撤销、查找、切换源码模式和恢复标签同样会把光标带进空格子，所以按状态统一交接：
+// 选区或文档变化、焦点从编辑器外进入、状态整体替换之后各核对一次。焦点在编辑器内部从输入框
+// 回到本体（格内按 ⌘ 组合键）不交回，否则快捷键落不到编辑器上。
+const emptyCellFocus = ViewPlugin.fromClass(class {
+  pending = true
+  constructor(readonly view: EditorView) { this.schedule(view.state) }
+  update(update: ViewUpdate): void {
+    if (update.selectionSet || update.docChanged) this.pending = true
+    // 目标行可能刚滚进视口还没绘制，之后的视口更新再试
+    if (this.pending) this.schedule(update.state)
+  }
+  // 聚焦会触发 CodeMirror 的焦点处理，离开更新周期再做
+  schedule(state: EditorState): void {
+    queueMicrotask(() => {
+      const { view } = this
+      if (!this.pending || view.state !== state) return
+      const current = state.selection.main.empty ? currentCell(state) : null
+      if (view.root.activeElement !== view.contentDOM || !current || (current.cell && current.cell.start < current.cell.end)) {
+        this.pending = false
+        return
+      }
+      const input = view.contentDOM.querySelector<HTMLElement>(`[data-table-from="${current.table.from}"] [data-table-row="${current.row}"] [data-column="${current.column}"] .cm-md-table-input`)
+      if (!input) return
+      this.pending = false
+      if (input.isContentEditable) input.focus()
+    })
+  }
+}, {
+  eventHandlers: {
+    focus(event) {
+      if (event.relatedTarget instanceof Node && this.view.dom.contains(event.relatedTarget)) return
+      this.pending = true
+      this.schedule(this.view.state)
+    },
+  },
+})
+
+function focusParagraph(view: EditorView): void {
+  const paragraph = pendingParagraph(view.state)
+  if (!paragraph) return
+  view.focus()
+  const focus = () => {
+    if (pendingParagraph(view.state) === paragraph && view.dom.contains(document.activeElement)) {
+      view.contentDOM.querySelector<HTMLElement>('.cm-md-table-paragraph-input')?.focus()
+    }
+  }
+  focus()
+  requestAnimationFrame(focus)
+}
+
+function insertParagraphText(view: EditorView, text: string): boolean {
+  const paragraph = pendingParagraph(view.state)
+  if (!paragraph) return false
+  if (!text || view.state.readOnly || !view.state.facet(EditorView.editable)) return true
+  const value = text.replace(/\r\n?/g, '\n')
+  const insert = paragraph.side < 0 ? value + paragraph.gap : paragraph.gap + value
+  view.dispatch({
+    changes: { from: paragraph.at, insert },
+    selection: { anchor: paragraph.at + (paragraph.side < 0 ? 0 : paragraph.gap.length) + value.length },
+    effects: setTableParagraph.of(null),
+    annotations: [tableEdit.of(true), isolateHistory.of('before')],
+    userEvent: 'input.type', scrollIntoView: true,
+  })
+  return true
+}
+
+function returnFromParagraph(view: EditorView, direction: number): boolean {
+  const paragraph = pendingParagraph(view.state)
+  if (!paragraph) return false
+  if (!direction || direction === -paragraph.side) {
+    view.dispatch({ selection: { anchor: paragraph.returnTo }, effects: setTableParagraph.of(null), userEvent: 'select', scrollIntoView: true })
+    view.focus()
+  }
+  return true
+}
+
 function currentCell(state: EditorState) {
+  if (pendingParagraph(state)) return null
   const table = tableAt(state, state.selection.main.head)
   if (!table) return null
   let row = table.rows.findIndex(row => state.selection.main.head <= row.to)
@@ -477,29 +794,32 @@ function currentCell(state: EditorState) {
   const cells = table.rows[row].cells
   const hint = state.field(virtualCell, false)
   const found = cells.findIndex(cell => state.selection.main.head < cell.to || state.selection.main.head === cell.end)
+  // 行尾竖线之后的位置属于下一格：源码里在这里输入就是补出下一格
   const column = hint?.row === table.rows[row].from ? hint.column
-    : Math.min(table.align.length - 1, found < 0 ? cells.length - 1 : found)
+    : Math.min(table.align.length - 1, found >= 0 ? found : table.rows[row].trailing ? cells.length : cells.length - 1)
   return { table, row, column, cell: cells[column] }
+}
+
+// 光标贴住所在的格：紧凑表格 `|xy|zw|` 的格尾就是右侧竖线的位置，空格子的位置也常与下一格
+// 左边的竖线重合。不贴住，光标会画到竖线之后，接着输入的字落进下一格。
+function cellAssoc(cell: TableCell | undefined, head: number): -1 | 0 | 1 {
+  if (!cell) return 0
+  if (cell.start === cell.end) return head === cell.to ? -1 : 0
+  return head === cell.end ? -1 : head === cell.start ? 1 : 0
 }
 
 function selectCell(view: EditorView, table: MarkdownTable, row: number, column: number, select = true): void {
   const target = table.rows[row]
   const cell = target.cells[column]
+  const from = cell?.start ?? target.to
+  const to = select ? (cell?.end ?? target.to) : from
   view.dispatch({
-    selection: EditorSelection.single(cell?.start ?? target.to, select ? (cell?.end ?? target.to) : (cell?.start ?? target.to)),
+    selection: from === to ? EditorSelection.create([EditorSelection.cursor(from, cellAssoc(cell, from))]) : EditorSelection.single(from, to),
     effects: setVirtualCell.of({ row: target.from, column }),
     scrollIntoView: true,
   })
-  if (!cell || cell.start === cell.end) {
-    view.focus()
-    const focus = () => {
-      const hint = view.state.field(virtualCell)
-      if (hint?.row !== target.from || hint.column !== column || !view.dom.contains(document.activeElement)) return
-      view.contentDOM.querySelector<HTMLElement>(`[data-table-from="${table.from}"] [data-table-row="${row}"] [data-column="${column}"] .cm-md-table-input`)?.focus()
-    }
-    focus()
-    requestAnimationFrame(focus)
-  }
+  // 空格子的输入框由 emptyCellFocus 接手，屏外的行等绘制出来再交
+  if (!cell || cell.start === cell.end) view.focus()
 }
 
 function editTable(view: EditorView, table: MarkdownTable, changes: ChangeSpec, row: number, column: number): void {
@@ -538,7 +858,7 @@ const textStart = (line: Line) => line.from + /^[ \t>]*(?:(?:[-*+]|\d+[.)]|#{1,6
  *
  * 紧挨着表格下面的一行一打字就会被并进表格当一行，所以要落在隔着空行的地方：
  * 向下是下一块的开头，向上是上一块的末尾，和渲染后看到的「上一段 / 下一段」一致。
- * 表格贴着文档开头或结尾、外面没有这样的位置时补一个空段落，可撤销。
+ * 文档边界外先给一个临时输入位置，实际输入正文时才创建段落。
  */
 function exitTable(state: EditorState, from: number, to: number, direction: number): TransactionSpec {
   const { doc } = state
@@ -547,31 +867,34 @@ function exitTable(state: EditorState, from: number, to: number, direction: numb
     const above = first.number > 1 ? doc.line(first.number - 1) : null
     if (above && !blankLine(above.text)) return { selection: { anchor: above.to } }
     if (above && above.number > 1) return { selection: { anchor: doc.line(above.number - 1).to } }
-    return { changes: { from: 0, insert: above ? '\n' : '\n\n' }, selection: { anchor: 0 } }
+    return { selection: { anchor: 0 }, effects: setTableParagraph.of({ at: 0, side: -1, gap: above ? '\n' : '\n\n', returnTo: state.selection.main.head }) }
   }
   const last = doc.lineAt(to)
   const below = last.number < doc.lines ? doc.line(last.number + 1) : null
   if (below && !blankLine(below.text)) return { selection: { anchor: textStart(below) } }
   if (below && below.number < doc.lines) return { selection: { anchor: textStart(doc.line(below.number + 1)) } }
-  const insert = below ? '\n' : '\n\n'
-  return { changes: { from: doc.length, insert }, selection: { anchor: doc.length + insert.length } }
+  return { selection: { anchor: doc.length }, effects: setTableParagraph.of({ at: doc.length, side: 1, gap: below ? '\n' : '\n\n', returnTo: state.selection.main.head }) }
 }
 
 function leaveTable(view: EditorView, table: MarkdownTable, direction: number): void {
   const exit = exitTable(view.state, table.from, table.to, direction)
-  view.dispatch({ ...exit, annotations: tableEdit.of(true), userEvent: exit.changes ? 'input' : 'select', scrollIntoView: true })
+  view.dispatch({ ...exit, userEvent: 'select', scrollIntoView: true })
+  focusParagraph(view)
 }
 
 function navigate(view: EditorView, direction: number, vertical = false): boolean {
+  if (pendingParagraph(view.state)) return vertical ? insertParagraphText(view, '\n') : returnFromParagraph(view, direction)
   const current = currentCell(view.state)
   if (!current) return false
   const { table, row, column } = current
   if (vertical && direction > 0 && row > 0 && row === table.rows.length - 1 && table.rows[row].cells.every(cell => cell.start === cell.end)) {
+    if (view.state.readOnly || !view.state.facet(EditorView.editable)) return true
     // 空末行按 Enter：删掉这一行，再按向下离开的规则落脚，一步撤销
     const remove = { changes: { from: view.state.doc.lineAt(table.rows[row].from).from - 1, to: table.to } }
     const removed = view.state.update(remove).state
     const end = remove.changes.from
     view.dispatch(view.state.update(remove, { ...exitTable(removed, table.from, end, 1), sequential: true, annotations: tableEdit.of(true), userEvent: 'input', scrollIntoView: true }))
+    focusParagraph(view)
     return true
   }
   const index = row * table.align.length + column + (vertical ? direction * table.align.length : direction)
@@ -586,31 +909,248 @@ function navigate(view: EditorView, direction: number, vertical = false): boolea
 }
 
 function cellText(text: string): string {
-  // 数清竖线前的反斜杠：偶数个（含零个）说明竖线没转义，补一个。按前一个字符判断会漏掉 `||` 的第二根
-  return text.replace(/\r\n?|\n/g, '<br>').replace(/(\\*)\|/g, (match, slashes: string) => slashes.length % 2 ? match : `${slashes}\\|`)
+  const value = text.replace(/\r\n?|\n/g, '<br>')
+  const pipes = tablePipes(value)
+  let from = 0, result = ''
+  for (const pipe of pipes) { result += value.slice(from, pipe) + '\\|'; from = pipe + 1 }
+  return pipes.length ? result + value.slice(from) : value
 }
 
 /** 结尾的反斜杠是否落单：落单的会和后面一个字组成转义 */
 const loneSlash = (text: string) => /(?:^|[^\\])(?:\\\\)*\\$/.test(text)
+
+function cellEditContext(state: EditorState, cell: TableCell) {
+  const verbatim = inVerbatim(state, cell)
+  const source = state.sliceDoc(cell.left, cell.right)
+  const parity = new Uint8Array(source.length + 1)
+  for (let i = 0; i < source.length; i++) parity[i + 1] = source[i] === '\\' ? 1 - parity[i] : 0
+  const code = tableCodeSpans(state.sliceDoc(cell.start, cell.end))
+  const inCode = (position: number) => {
+    const pos = position - cell.start
+    let left = 0, right = code.length
+    while (left < right) {
+      const middle = (left + right) >>> 1
+      if (code[middle].from < pos) left = middle + 1
+      else right = middle
+    }
+    return left > 0 && pos < code[left - 1].to
+  }
+  return { verbatim, source, parity, inCode, hidden: new Set(hiddenEscapes(state, cell, verbatim)) }
+}
 
 /**
  * 把格子里的一次改动换成按看到的字改原文：只显示一个字的转义对，删除时整对处理，选区端点
  * 停在一对中间时不越过看得见的那个字；新内容与两侧落单的反斜杠相接、会转义掉竖线（改变分格），
  * 或在代码外转义掉反斜杠、`<br>`（改变显示）时，补一个反斜杠。
  */
-function cellChange(state: EditorState, cell: TableCell, from: number, to: number, text: string) {
-  const code = inCode(state, cell)
+function prepareCellChange(cell: TableCell, context: ReturnType<typeof cellEditContext>, from: number, to: number, text: string) {
+  const { verbatim, source, parity, inCode, hidden } = context
   const empty = from === to
-  for (const escape of hiddenEscapes(state, cell, code)) {
-    if (to === escape + 1) to = empty ? escape : from === escape ? escape + 2 : escape
-    if (from === escape + 1) from = escape
-  }
-  const escapes = (pos: number, next: string) => next.startsWith('|') || (/^(?:\\|<br)/i.test(next) && !code(pos))
-  const before = from > cell.start ? state.sliceDoc(cell.start, from) : ''
-  let insert = cellText(text)
-  if (loneSlash(before) && escapes(from, insert)) insert = `\\${insert}`
-  if (loneSlash(before + insert) && escapes(to, state.sliceDoc(to, to + 3))) insert += '\\'
+  if (hidden.has(to - 1)) to = empty ? to - 1 : from === to - 1 ? to + 1 : to - 1
+  if (hidden.has(from - 1)) from--
+  const escapes = (pos: number, next: string) => !inCode(pos) && (next.startsWith('|') || (/^(?:\\|`|<br)/i.test(next) && !verbatim(pos)))
+  let insert = inCode(from) && inCode(to) ? text.replace(/\r\n?|\n/g, '<br>') : cellText(text)
+  const beforeOdd = !!parity[from - cell.left]
+  if (beforeOdd && escapes(from, insert)) insert = `\\${insert}`
+  const endsOdd = /^\\*$/.test(insert) ? beforeOdd !== loneSlash(insert) : loneSlash(insert)
+  if (endsOdd && escapes(to, source.slice(to - cell.left, to - cell.left + 3))) insert += '\\'
   return { from, to, insert }
+}
+
+type CellTextEdit = { from: number; to: number; text: string }
+
+function cellChanges(state: EditorState, cell: TableCell, edits: CellTextEdit[]) {
+  const context = cellEditContext(state, cell)
+  const changes = edits.map(edit => prepareCellChange(cell, context, edit.from, edit.to, edit.text))
+  let candidate = '', copied = cell.left
+  for (const change of changes) {
+    if (change.from < copied) return null
+    candidate += state.sliceDoc(copied, change.from) + change.insert
+    copied = change.to
+  }
+  candidate += state.sliceDoc(copied, cell.right)
+  // 按整格复核，兼顾刚插入/删除反引号导致代码跨度变化的情况，再收回最小源码改动。
+  const original = state.sliceDoc(cell.left, cell.right)
+  let safe = cellText(candidate)
+  if (state.sliceDoc(cell.right, cell.right + 1) === '|' && loneSlash(safe)) safe += '\\'
+  if (safe !== candidate || changes.length > 1) {
+    if (safe === original) return safe === candidate ? { from: cell.left, to: cell.left, insert: '' } : null
+    let start = 0, end = original.length, nextEnd = safe.length
+    while (start < end && start < nextEnd && original[start] === safe[start]) start++
+    while (end > start && nextEnd > start && original[end - 1] === safe[nextEnd - 1]) { end--; nextEnd-- }
+    return { from: cell.left + start, to: cell.left + end, insert: safe.slice(start, nextEnd) }
+  }
+  return changes[0]
+}
+
+function cellChange(state: EditorState, cell: TableCell, from: number, to: number, text: string) {
+  return cellChanges(state, cell, [{ from, to, text }])
+}
+
+type TextChange = { from: number; to: number; insert: string }
+
+/** 格线位置由调用方在拼接格子时记录，不能再由可能跨格的代码跨度反推。 */
+function rowEscapePositions(text: string, pipes: number[]): number[] | null {
+  const actual = tablePipes(text)
+  if (actual.length === pipes.length && actual.every((pipe, index) => pipe === pipes[index])) return []
+  const escapes: number[] = []
+  let start = 0
+  for (const end of [...pipes, text.length]) {
+    for (const pos of unpairedBackticks(text.slice(start, end))) escapes.push(start + pos)
+    start = end + 1
+  }
+  return escapes.length ? escapes : null
+}
+
+/** 追加源码格子，并记录新格线的位置；末尾已有的竖线可直接作为第一格的左边界。 */
+function rowSuffix(values: string[], trailing: boolean): { text: string; pipes: number[] } {
+  let text = trailing ? '' : ' |'
+  const pipes = trailing ? [] : [text.length - 1]
+  for (const value of values) {
+    text += ` ${value} |`
+    pipes.push(text.length - 1)
+  }
+  return { text, pipes }
+}
+
+/**
+ * 改反引号可能让代码跨过原来的格线。先按各格编辑，再在受影响的行里复核格线位置。
+ * 只有分格会变时，才把该行各格中原本没配对的反引号转义；完整代码与未编辑行不动。
+ */
+function preserveTableRows(state: EditorState, changes: TextChange[], rows: Set<number>, insertedPipes = new Map<TextChange, number[]>()): TextChange[] {
+  const result = [...changes]
+  const grouped = new Map<number, TextChange[]>()
+  for (const change of changes) {
+    const line = state.doc.lineAt(change.from)
+    if (!rows.has(line.from) || change.to > line.to) continue
+    const edits = grouped.get(line.from) ?? []
+    edits.push(change)
+    grouped.set(line.from, edits)
+  }
+  for (const [from, edits] of grouped) {
+    const line = state.doc.lineAt(from)
+    if (edits.some(change => change.insert.includes('\n'))) continue
+    const original = line.text
+    const set = state.changes(edits)
+    const nextFrom = set.mapPos(line.from, -1)
+    const expected = tablePipes(original).map(pipe => set.mapPos(line.from + pipe, 1) - nextFrom)
+    for (const edit of edits) {
+      const at = set.mapPos(edit.from, -1) - nextFrom
+      expected.push(...(insertedPipes.get(edit) ?? []).map(pipe => at + pipe))
+    }
+    expected.sort((a, b) => a - b)
+    let candidate = '', copied = line.from
+    for (const edit of edits) { candidate += state.sliceDoc(copied, edit.from) + edit.insert; copied = edit.to }
+    candidate += state.sliceDoc(copied, line.to)
+    const positions = rowEscapePositions(candidate, expected)
+    if (!positions) return []
+    if (!positions.length) continue
+    const escapes = positions.map(pos => ({ from: nextFrom + pos, to: nextFrom + pos, insert: '\\' }))
+    // 组合源码改动而不把整行变成一次替换，光标与多选区仍能精确映射。
+    const repaired = set.compose(ChangeSet.of(escapes, set.newLength))
+    for (const edit of edits) result.splice(result.indexOf(edit), 1)
+    repaired.iterChanges((from, to, _fromB, _toB, inserted) => result.push({ from, to, insert: inserted.toString() }))
+  }
+  return result.sort((a, b) => a.from - b.from)
+}
+
+export interface TextMatch { from: number; to: number }
+interface SearchCell { cell: TableCell; text: string; positions: number[] }
+interface SearchTable { from: number; to: number; cells: SearchCell[] }
+const searchTables = new WeakMap<EditorState['doc'], SearchTable[]>()
+
+/** 搜索需要覆盖屏外表格；完整解析每个文档版本至多一次，后续关键词变化复用投影。 */
+function tablesForSearch(state: EditorState): SearchTable[] {
+  const cached = searchTables.get(state.doc)
+  if (cached) return cached
+  const parsed = syntaxTree(state)
+  const tree: Tree = parsed.length === state.doc.length ? parsed : markdownParser.parse(state.doc.toString())
+  const tables: SearchTable[] = []
+  const front = frontmatterRange(state.doc.toString())
+  tree.iterate({ enter(node) {
+    if (front && node.name !== 'Document' && node.from >= front.from && node.from < front.to) return false
+    if (node.name !== 'Table') return
+    const table = readTable(state, node.node)
+    const cells = table.rows.flatMap(row => row.cells.slice(0, table.align.length)).map(cell => {
+      const source = state.sliceDoc(cell.start, cell.end)
+      const hidden = new Set(hiddenEscapes(state, cell, inVerbatim(state, cell, tree)))
+      // 格式标记切分文字节点，避免替换横跨标记后留下半个加粗或代码跨度。
+      const marks = new Set<number>()
+      const boundary = (from: number, to: number) => {
+        for (let pos = from; pos < to; pos++) marks.add(pos)
+      }
+      cellSyntax(tree, cell)?.cursor().iterate(part => {
+        if (part.name === 'Link') {
+          const label = linkTextRange(state, part.node)
+          if (label) { boundary(part.from, label.from); boundary(label.to, part.to) }
+        } else if (['CodeMark', 'EmphasisMark', 'StrikethroughMark', 'HTMLTag', 'Image'].includes(part.name)) {
+          boundary(part.from, part.to)
+          return false
+        }
+      })
+      const positions: number[] = []
+      let text = ''
+      for (let pos = cell.start; pos < cell.end; pos++) {
+        if (hidden.has(pos)) continue
+        positions.push(pos)
+        text += marks.has(pos) ? '\u0000' : source[pos - cell.start]
+      }
+      return { cell, text, positions }
+    })
+    tables.push({ from: node.from, to: node.to, cells })
+    return false
+  } })
+  searchTables.set(state.doc, tables)
+  return tables
+}
+
+/** 表格内只匹配各单元格的文字，分隔行、格线和隐藏转义符不参与查找。 */
+export function findTextMatches(state: EditorState, query: string): TextMatch[] {
+  if (!query || query.includes('\u0000')) return []
+  const matches: TextMatch[] = []
+  const pattern = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const scan = (text: string, position: (index: number) => number) => {
+    for (const match of text.matchAll(new RegExp(pattern, 'gi'))) {
+      matches.push({ from: position(match.index!), to: position(match.index! + match[0].length - 1) + 1 })
+    }
+  }
+  let copied = 0
+  for (const table of tablesForSearch(state)) {
+    const from = copied
+    scan(state.sliceDoc(from, table.from), index => from + index)
+    for (const cell of table.cells) scan(cell.text, index => cell.positions[index])
+    copied = table.to
+  }
+  scan(state.sliceDoc(copied), index => copied + index)
+  return matches
+}
+
+/** 同格的多个匹配一起复核转义，一次事务写回，避免全部替换产生重叠的源码改动。 */
+export function replaceTextMatches(view: EditorView, matches: TextMatch[], text: string): void {
+  if (view.state.readOnly || !view.state.facet(EditorView.editable)) return
+  const tables = tablesForSearch(view.state)
+  const grouped = new Map<TableCell, CellTextEdit[]>()
+  const changes: { from: number; to: number; insert: string }[] = []
+  const rows = new Set<number>()
+  let tableIndex = 0, cellIndex = 0
+  for (const match of matches) {
+    while (tableIndex < tables.length && match.from >= tables[tableIndex].to) { tableIndex++; cellIndex = 0 }
+    const table = tables[tableIndex]
+    if (!table || match.to <= table.from) { changes.push({ ...match, insert: text }); continue }
+    while (cellIndex < table.cells.length && match.from >= table.cells[cellIndex].cell.right) cellIndex++
+    const cell = table.cells[cellIndex]?.cell
+    if (!cell || !withinCell(cell, match.from, match.to)) continue
+    const edits = grouped.get(cell) ?? []
+    edits.push({ ...match, text })
+    grouped.set(cell, edits)
+    rows.add(view.state.doc.lineAt(cell.left).from)
+  }
+  for (const [cell, edits] of grouped) {
+    const change = cellChanges(view.state, cell, edits)
+    if (!change) return
+    changes.push(change)
+  }
+  if (changes.length) view.dispatch({ changes: preserveTableRows(view.state, changes.sort((a, b) => a.from - b.from), rows), annotations: tableEdit.of(true), userEvent: 'input.replace' })
 }
 
 const unchanged = (change: { from: number; to: number; insert: string }, from: number, to: number, text: string) =>
@@ -638,12 +1178,15 @@ function insertCellText(view: EditorView, from: number, to: number, text: string
       // 只有空格的格子：写成 `| 内容 |`，不把字贴在右边的竖线上
       const value = cellText(text)
       const insert = ` ${value}${view.state.sliceDoc(cell.right, cell.right + 1) === '|' ? ' ' : ''}`
-      view.dispatch({ changes: { from: cell.left, to: cell.right, insert }, selection: { anchor: cell.left + 1 + value.length }, annotations: tableEdit.of(true), userEvent: 'input.type' })
+      view.dispatch({ changes: { from: cell.left, to: cell.right, insert }, selection: EditorSelection.create([EditorSelection.cursor(cell.left + 1 + value.length, -1)]), annotations: tableEdit.of(true), userEvent: 'input.type' })
       return true
     }
     const change = cellChange(view.state, cell, from, to, text)
+    if (!change) return true
     if (unchanged(change, from, to, text) && cell.start !== cell.end) return false
-    view.dispatch({ changes: change, selection: { anchor: change.from + change.insert.length }, annotations: tableEdit.of(true), userEvent: 'input.type' })
+    const changes = preserveTableRows(view.state, [change], new Set([view.state.doc.lineAt(cell.left).from]))
+    const anchor = view.state.changes(changes).mapPos(to, 1)
+    view.dispatch({ changes, selection: EditorSelection.create([EditorSelection.cursor(anchor, -1)]), annotations: tableEdit.of(true), userEvent: 'input.type' })
   } else {
     const target = table.rows[row]
     const trailing = target.trailing
@@ -654,6 +1197,7 @@ function insertCellText(view: EditorView, from: number, to: number, text: string
 }
 
 function deleteAtBoundary(view: EditorView, direction: number): boolean {
+  if (returnFromParagraph(view, direction)) return true
   const current = currentCell(view.state)
   if (!current) return false
   const range = view.state.selection.main
@@ -661,6 +1205,7 @@ function deleteAtBoundary(view: EditorView, direction: number): boolean {
 }
 
 function deleteToCellEdge(view: EditorView, direction: number): boolean {
+  if (pendingParagraph(view.state)) return true
   const current = currentCell(view.state)
   if (!current || !view.state.selection.main.empty) return false
   if (!current.cell) return true
@@ -671,6 +1216,7 @@ function deleteToCellEdge(view: EditorView, direction: number): boolean {
 }
 
 function moveAcrossCell(view: EditorView, direction: number): boolean {
+  if (returnFromParagraph(view, direction)) return true
   const current = currentCell(view.state)
   if (!current || !view.state.selection.main.empty) return false
   const { table, row, column, cell } = current
@@ -707,6 +1253,7 @@ function cellAtPoint(view: EditorView, event: Pick<MouseEvent, 'clientX' | 'clie
 }
 
 function moveVertical(view: EditorView, direction: 1 | -1, extend = false): boolean {
+  if (returnFromParagraph(view, direction)) return true
   const current = currentCell(view.state)
   if (!current) return false
   const { table, row, column, cell } = current
@@ -753,10 +1300,15 @@ function moveVertical(view: EditorView, direction: 1 | -1, extend = false): bool
 
 export const tableEditing = [
   virtualCell,
+  tableParagraph,
+  tableParagraphHistory,
+  tableParagraphLifecycle,
+  emptyCellFocus,
   tableField,
+  tableGeometry.of([]),
   tableLayout,
   EditorState.transactionFilter.of(tr => {
-    if (!tr.selection || tr.effects.some(effect => effect.is(setVirtualCell))) return tr
+    if (!tr.selection || tr.isUserEvent('input.type.compose') || tr.effects.some(effect => effect.is(setVirtualCell))) return tr
     const range = tr.newSelection.main
     const current = currentCell(tr.state)
     if (!current) return tr
@@ -769,14 +1321,13 @@ export const tableEditing = [
         head += !tr.isUserEvent('select.pointer') && tr.startState.selection.main.head === head - 1 ? 1 : -1
       }
     }
-    // 光标贴住格里的字：紧凑表格 `|xy|zw|` 的格尾就是右侧竖线的位置，不贴前面的字，光标会画到竖线之后，接着输入的字落进下一格
-    const assoc = range.empty && cell && cell.start < cell.end && (head === cell.end || head === cell.start) ? (head === cell.end ? -1 : 1) : range.assoc
+    const assoc = (range.empty ? cellAssoc(cell, head) : 0) || range.assoc
     if (head === range.head && assoc === range.assoc) return tr
     const next = range.empty ? EditorSelection.cursor(head, assoc) : EditorSelection.range(range.anchor, head)
     return [tr, { selection: tr.newSelection.replaceRange(next), sequential: true }]
   }),
   EditorState.changeFilter.of(tr => {
-    if (!tr.isUserEvent('delete') && !tr.isUserEvent('input') && !tr.isUserEvent('move')) return true
+    if (!isCellEdit(tr)) return true
     if (tr.annotation(tableEdit)) return true
     const table = tableAt(tr.startState, tr.startState.selection.main.head)
     if (!table) return true
@@ -809,22 +1360,33 @@ export const tableEditing = [
   }),
   // 删除、剪切、拖放和多光标编辑不经过 insertCellText，同样按看到的字改原文。组合输入期间不动，免得打断输入法
   EditorState.transactionFilter.of(tr => {
-    if (!tr.docChanged || tr.annotation(tableEdit) || tr.isUserEvent('input.type.compose') || !['input', 'delete', 'move'].some(event => tr.isUserEvent(event))) return tr
+    if (!tr.docChanged || tr.annotation(tableEdit) || tr.isUserEvent('input.type.compose') || !isCellEdit(tr)) return tr
     const changes: { from: number; to: number; insert: string }[] = []
     let rewritten = false
+    let rejected = false
+    const rows = new Set<number>()
     tr.changes.iterChanges((from, to, _fromB, _toB, inserted) => {
       const text = inserted.toString()
       const cell = cellAround(tr.startState, from, to)
+      if (cell) rows.add(tr.startState.doc.lineAt(cell.left).from)
       const change = cell ? cellChange(tr.startState, cell, from, to, text) : { from, to, insert: text }
+      if (!change) { rejected = true; return }
       rewritten ||= !unchanged(change, from, to, text)
       changes.push(change)
     })
-    if (!rewritten || changes.some((change, index) => index && change.from < changes[index - 1].to)) return tr
-    const set = tr.startState.changes(changes)
+    if (rejected) return []
+    if (changes.some((change, index) => index && change.from < changes[index - 1].to)) return []
+    const safe = preserveTableRows(tr.startState, changes, rows)
+    rewritten ||= safe.length !== changes.length || safe.some((change, index) => !unchanged(change, changes[index].from, changes[index].to, changes[index].insert))
+    if (!rewritten) return tr
+    const set = tr.startState.changes(safe)
     // 单光标单处改动时光标落在新内容之后；多光标、拖动把原来的选区换算过来
-    const selection = changes.length === 1 && tr.newSelection.ranges.length === 1
-      ? EditorSelection.single(changes[0].from + changes[0].insert.length)
-      : tr.newSelection.map(tr.changes.invertedDesc).map(set, 1)
+    const mapPos = (pos: number, assoc: number) => set.mapPos(tr.changes.invertedDesc.mapPos(pos, assoc), assoc)
+    const selection = safe.length === 1 && tr.newSelection.ranges.length === 1 && tr.newSelection.main.empty
+      ? EditorSelection.create([EditorSelection.cursor(mapPos(tr.newSelection.main.head, 1), -1)])
+      : EditorSelection.create(tr.newSelection.ranges.map(range => range.empty
+        ? EditorSelection.cursor(mapPos(range.head, range.assoc || 1), range.assoc)
+        : EditorSelection.range(mapPos(range.anchor, range.anchor < range.head ? -1 : 1), mapPos(range.head, range.anchor < range.head ? 1 : -1))), tr.newSelection.mainIndex)
     const history = tr.annotation(Transaction.addToHistory)
     return {
       changes: set,
@@ -842,6 +1404,7 @@ export const tableEditing = [
     { key: 'Mod-Enter', run: view => insertRow(view) },
     { key: 'Mod-Shift-Enter', run: view => insertRow(view, false) },
     { key: 'Shift-Enter', run: view => {
+      if (insertParagraphText(view, '\n')) return true
       if (!currentCell(view.state)) return false
       const { from, to } = view.state.selection.main
       return insertCellText(view, from, to, '\n')
@@ -858,8 +1421,9 @@ export const tableEditing = [
     { key: 'ArrowDown', run: view => moveVertical(view, 1) },
     { key: 'Shift-ArrowUp', run: view => moveVertical(view, -1, true) },
     { key: 'Shift-ArrowDown', run: view => moveVertical(view, 1, true) },
+    { key: 'Escape', run: view => returnFromParagraph(view, 0) },
   ])),
-  EditorView.inputHandler.of((view, from, to, text) => view.composing ? false : insertCellText(view, from, to, text)),
+  EditorView.inputHandler.of((view, from, to, text) => view.composing ? false : insertParagraphText(view, text) || insertCellText(view, from, to, text)),
   EditorView.mouseSelectionStyle.of((view, event) => {
     if (event.button !== 0 || event.altKey || event.metaKey || event.ctrlKey) return null
     const point = cellAtPoint(view, event)
@@ -908,7 +1472,7 @@ export const tableEditing = [
       event.preventDefault()
       if (target) {
         const anchor = Math.max(target.start, Math.min(target.end, view.posAtCoords({ x: event.clientX, y: event.clientY }) ?? target.start))
-        view.dispatch({ selection: { anchor }, effects: setVirtualCell.of({ row: table.rows[rowIndex].from, column }) })
+        view.dispatch({ selection: EditorSelection.create([EditorSelection.cursor(anchor, cellAssoc(target, anchor))]), effects: setVirtualCell.of({ row: table.rows[rowIndex].from, column }) })
       } else selectCell(view, table, rowIndex, column, false)
       const input = cell.querySelector<HTMLElement>('.cm-md-table-input')
       if (input) input.focus()
@@ -916,6 +1480,12 @@ export const tableEditing = [
       return true
     },
     paste(event, view) {
+      if (pendingParagraph(view.state)) {
+        event.preventDefault()
+        insertParagraphText(view, event.clipboardData?.getData('text/plain') ?? '')
+        view.focus()
+        return true
+      }
       const current = currentCell(view.state)
       const text = event.clipboardData?.getData('text/plain')
       if (!current || text === undefined || !view.state.facet(EditorView.editable) || view.state.readOnly) return false
@@ -932,30 +1502,47 @@ export const tableEditing = [
       const { table, row, column } = current
       const values = text.replace(/\r\n?/g, '\n').replace(/\n$/, '').split('\n').map(line => line.split('\t'))
       const columns = Math.max(table.align.length, column + Math.max(...values.map(row => row.length)))
-      const changes: ChangeSpec[] = []
+      const changes: TextChange[] = []
+      const protectedRows = new Set<number>()
+      const insertedPipes = new Map<TextChange, number[]>()
       const rows = [...table.rows, table.delimiter]
       for (const target of rows) {
         const index = table.rows.indexOf(target)
-        for (let c = 0; c < Math.min(target.cells.length, table.align.length); c++) {
+        for (let c = 0; c < Math.min(target.cells.length, columns); c++) {
           const value = values[index - row]?.[c - column]
-          if (index >= row && c >= column && value !== undefined) changes.push(cellChange(view.state, target.cells[c], target.cells[c].start, target.cells[c].end, value))
+          if (index >= row && c >= column && value !== undefined) {
+            const change = cellChange(view.state, target.cells[c], target.cells[c].start, target.cells[c].end, value)
+            if (!change) { event.preventDefault(); return true }
+            changes.push(change)
+            protectedRows.add(view.state.doc.lineAt(target.from).from)
+          }
         }
         if (target.cells.length < columns) {
           const extra = Array.from({ length: columns - target.cells.length }, (_, i) => {
             const c = i + target.cells.length
             return index < 0 ? '---' : cellText(values[index - row]?.[c - column] ?? '')
           })
-          const trailing = target.trailing
-          changes.push({ from: target.to, insert: `${trailing ? '' : ' |'} ${extra.join(' | ')} |` })
+          const suffix = rowSuffix(extra, target.trailing)
+          const change = { from: target.to, to: target.to, insert: suffix.text }
+          changes.push(change)
+          if (index >= 0) {
+            protectedRows.add(view.state.doc.lineAt(target.from).from)
+            insertedPipes.set(change, suffix.pipes)
+          }
         }
       }
+      const safe = preserveTableRows(view.state, changes.sort((a, b) => a.from - b.from), protectedRows, insertedPipes)
+      if (!safe.length) { event.preventDefault(); return true }
       const prefix = view.state.sliceDoc(view.state.doc.lineAt(table.delimiter.from).from, table.delimiter.from)
       let added = ''
       for (let r = table.rows.length; r < row + values.length; r++) {
-        added += `\n${prefix}| ${Array.from({ length: columns }, (_, c) => cellText(values[r - row]?.[c - column] ?? '')).join(' | ')} |`
+        const suffix = rowSuffix(Array.from({ length: columns }, (_, c) => cellText(values[r - row]?.[c - column] ?? '')), true)
+        const text = `${prefix}|${suffix.text}`
+        const escapes = new Set(rowEscapePositions(text, [prefix.length, ...suffix.pipes.map(pipe => prefix.length + 1 + pipe)]))
+        added += '\n' + text.split('').map((char, index) => (escapes.has(index) ? '\\' : '') + char).join('')
       }
-      if (added) changes.push({ from: table.to, insert: added })
-      editTable(view, table, changes, row + values.length - 1, column + values.at(-1)!.length - 1)
+      if (added) safe.push({ from: table.to, to: table.to, insert: added })
+      editTable(view, table, safe, row + values.length - 1, column + values.at(-1)!.length - 1)
       view.focus()
       event.preventDefault()
       return true

@@ -121,6 +121,7 @@ src/
 - 这一版攒下的验收脚本，改动碰到哪儿就跑哪条（拿不准就都跑）：
   - `npm run verify:markdown`：打开再保存，字节不许变（`save(open(x)) === x`）
   - `npm run verify:tables`：表格单元格编辑、输入法、撤销、粘贴、导出与多标签隔离
+  - `npm run verify:table-syntax`：表格代码跨度、可视查找替换与 Word 解析一致性（纯 Node）
   - `npm run verify:features`：界面功能逐条断言，正文里能看见的东西最多的一条网
   - `npm run verify:scroll-render`：滚到没解析过的地方，那几行也必须渲染过
   - `npm run verify:source-mode`：渲染与源码双向切换，检查选区方向、光标可见性和视口位置

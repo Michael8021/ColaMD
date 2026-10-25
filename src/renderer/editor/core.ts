@@ -9,13 +9,13 @@
 // 这一层需要 DOM（EditorView 要做布局测量）。不依赖 DOM 的那一半在 state.ts 里，
 // 验收脚本直接消费那一半，所以保真的证明不需要真实浏览器。
 
+import { tableEditing } from './table-editing'
 import { Compartment, EditorState, RangeSet } from '@codemirror/state'
 import { EditorView, drawSelection, dropCursor, highlightSpecialChars, rectangularSelection, crosshairCursor, Decoration } from '@codemirror/view'
 import { syntaxTree } from '@codemirror/language'
 import { undo, redo } from '@codemirror/commands'
 import { livePreview, setEditorFocus } from './live-preview'
 import { listInput } from './list-input'
-import { tableEditing } from './table-editing'
 import { searchHighlightField } from './search-highlight'
 import { stateExtensions, editableCompartment, bodyStart } from './state'
 import { editorTheme } from './source-theme'
@@ -127,7 +127,6 @@ export function createEditorCore(parent: HTMLElement, options: EditorOptions = {
     }),
     // 回车续列表。这是编辑器的输入手感，与渲染无关，所以单独一个模块。
     listInput,
-    tableEditing,
     // 检索高亮。面板靠 effect 改它，而 effect 得有 StateField 接住；
     // 不装这一条，检索面板会以为高亮画上了，实际什么也没发生。
     searchHighlightField,
@@ -135,6 +134,7 @@ export function createEditorCore(parent: HTMLElement, options: EditorOptions = {
     // `[ ]` 两个方框之间那一格里：左右键要一格一格挪过去，停在里面打字又把
     // `- [ ]` 敲成 `- [x]` 之类的残骸（#164）。声明成原子区间后，光标一次跨过它。
     taskMarkerAtomicRanges,
+    tableEditing,
     editableCompartment.of(EditorView.editable.of(options.editable ?? true)),
     // 文档变化的唯一出口：把新文本交给外壳
     EditorView.updateListener.of((update) => {

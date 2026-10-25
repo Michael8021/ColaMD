@@ -388,6 +388,19 @@
 
 .cm-editor:has(.cm-md-table-input:focus) .cm-cursorLayer { display: none; }
 
+.cm-content .cm-md-table-paragraph {
+  margin-block: 0.5em;
+}
+
+.cm-content .cm-md-table-paragraph-input {
+  min-height: 1.75em;
+  outline: none;
+  caret-color: var(--text-color);
+  white-space: pre-wrap;
+}
+
+.cm-editor:has(.cm-md-table-paragraph-input[contenteditable="true"]:focus) .cm-cursorLayer { display: none; }
+
 /* ======= 分隔线 ======= */
 
 /* 分隔线。
@@ -594,6 +607,7 @@ body.exporting .cm-cursor,
 body.exporting .cm-cursorLayer,
 body.exporting .cm-selectionLayer,
 body.exporting .cm-selectionBackground,
+body.exporting .cm-content .cm-md-table-paragraph,
 body.exporting .cm-content .cm-md-frontmatter {
   display: none !important;
 }
@@ -603,6 +617,7 @@ body.exporting .cm-content .cm-md-frontmatter {
   .cm-cursorLayer,
   .cm-selectionLayer,
   .cm-selectionBackground,
+  .cm-content .cm-md-table-paragraph,
   .cm-content .cm-md-frontmatter {
     display: none !important;
   }
