@@ -25,6 +25,7 @@ const RENDER_TIMEOUT_MS = 5000
 
 let styleEl: HTMLStyleElement | null = null
 let savedScrollTop = 0
+let printCopy: HTMLElement | null = null
 
 // 选择器带上 `body.paper`：CodeMirror 的 baseTheme 是运行时注入到 <head> 末尾的，
 // 同为单类时它永远排在后面；加高优先级才盖得住。
@@ -32,7 +33,48 @@ const PAPER_RULES = `
 body.${PAPER_CLASS} #editor { height: auto !important; overflow: visible !important; }
 body.${PAPER_CLASS} #editor .cm-editor { height: auto !important; }
 body.${PAPER_CLASS} #editor .cm-scroller { display: block !important; height: auto !important; overflow: visible !important; }
+body.${PAPER_CLASS} #editor > .colamd-print-copy { display: none !important; }
+@media print {
+  body.${PAPER_CLASS} #editor:has(> .colamd-print-copy) > .cm-editor:not(.colamd-print-copy) { display: none !important; }
+  body.${PAPER_CLASS} #editor > .colamd-print-copy { display: block !important; }
+}
 `
+
+/** CSS table-row 的装饰行在 Chromium 分页时会拆行，强行避让还可能截尾。
+ * 打印副本使用原生表格的分页语义，保留装饰类、作用域列宽和行内内容。
+ * 副本不进入 CodeMirror 管理的 DOM，只有打印媒体可见，退出后立即移除。 */
+async function preparePrintCopy(): Promise<void> {
+  const original = getEditorView()?.dom
+  if (!original?.querySelector('.cm-md-table-row')) return
+  const copy = original.cloneNode(true) as HTMLElement
+  copy.classList.add('colamd-print-copy')
+  for (const table of copy.querySelectorAll<HTMLElement>('.cm-md-table-widget')) {
+    const rows = Array.from(table.children).filter(row => row.classList.contains('cm-md-table-row'))
+    if (!rows.length) continue
+    const native = document.createElement('table')
+    for (const attr of table.attributes) native.setAttribute(attr.name, attr.value)
+    for (const row of rows) {
+      const tr = document.createElement('tr')
+      for (const attr of row.attributes) tr.setAttribute(attr.name, attr.value)
+      for (const cell of Array.from(row.children).filter(child => child.classList.contains('cm-md-table-cell'))) {
+        const td = document.createElement(row.classList.contains('cm-md-table-header') ? 'th' : 'td')
+        for (const attr of cell.attributes) td.setAttribute(attr.name, attr.value)
+        td.append(...Array.from(cell.childNodes))
+        tr.appendChild(td)
+      }
+      native.appendChild(tr)
+    }
+    table.replaceWith(native)
+  }
+  // cloneNode 不复制 canvas 位图；保留文档中已有的绘制内容。
+  const canvases = original.querySelectorAll('canvas')
+  copy.querySelectorAll('canvas').forEach((canvas, index) => {
+    canvas.getContext('2d')?.drawImage(canvases[index], 0, 0)
+  })
+  original.after(copy)
+  printCopy = copy
+  await Promise.all(Array.from(copy.querySelectorAll('img')).map(image => image.decode().catch(() => {})))
+}
 
 /** CodeMirror 内部那个「视口不受限」的开关。 */
 type PrintableViewState = { printing?: boolean }
@@ -94,8 +136,11 @@ export function restoreViewport(): void {
  * 摊平是为了分页：CM6 的编辑器与滚动容器是 flex 加固定高度，强制分页在它们里面不生效。
  * 渲染整篇是为了内容：不这么做，纸上只有当前视口那一屏。
  */
-export async function enterPaperLayout(): Promise<boolean> {
-  if (styleEl) return true
+export async function enterPaperLayout(nativeTables = false): Promise<boolean> {
+  if (styleEl) {
+    if (nativeTables && !printCopy) await preparePrintCopy()
+    return true
+  }
   if (!getEditorView()) return false
   savedScrollTop = getEditorScroller()?.scrollTop ?? 0
   const style = document.createElement('style')
@@ -105,11 +150,14 @@ export async function enterPaperLayout(): Promise<boolean> {
   document.body.classList.add(PAPER_CLASS)
   styleEl = style
   await renderWholeDocument()
+  if (nativeTables) await preparePrintCopy()
   return true
 }
 
 /** 收起纸，回到屏幕布局与原来的滚动位置。 */
 export function exitPaperLayout(): void {
+  printCopy?.remove()
+  printCopy = null
   restoreViewport()
   if (!styleEl) return
   styleEl.remove()

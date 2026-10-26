@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
-import { readFileSync, writeFileSync, statSync } from 'node:fs'
+import { spawn, spawnSync } from 'node:child_process'
+import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
@@ -16,7 +16,12 @@ const fixture = '# 单元格编辑\n\n| 名称 | 内容 | 数量 |\n| :--- | :--
 writeFileSync(file, fixture)
 const port = 9940 + Math.floor(Math.random() * 10)
 const inspect = port + 1000
-const child = spawn(electron, ['scripts/offscreen-window.cjs', file, `--user-data-dir=${udd}`, `--remote-debugging-port=${port}`, `--inspect=${inspect}`], { cwd: ROOT, stdio: 'ignore' })
+// user-data-dir 不隔离主进程的 ~/.colamd；正式回归也不应改用户的最近文件和主题。
+const isolatedHome = join(dir, 'home')
+mkdirSync(isolatedHome, { recursive: true })
+const launcher = join(dir, 'launch.cjs')
+writeFileSync(launcher, `const {app}=require('electron');app.setPath('home',${JSON.stringify(isolatedHome)});require(${JSON.stringify(join(ROOT, 'scripts/offscreen-window.cjs'))})`)
+const child = spawn(electron, [launcher, file, `--user-data-dir=${udd}`, `--remote-debugging-port=${port}`, `--inspect=${inspect}`], { cwd: ROOT, stdio: 'ignore' })
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 let ws, mainWS, passed = 0
 const errors = []
@@ -400,6 +405,84 @@ try {
       check('整篇替换后没有旧表格行装饰', await evaluate(`v.contentDOM.querySelectorAll('.cm-md-table-row').length`) === 0)
       await setDoc('| C | D |\n|---|---|\n| new | table |\n')
       check('整篇替换后每行均在当前表格 wrapper 内', await evaluate(`[...v.contentDOM.querySelectorAll('.cm-md-table-row')].every(row => row.closest('.cm-md-table-widget'))`))
+    },
+    async escapeColors() {
+      const source = '正文 a\\|b\n\n| A | B |\n|---|---|\n| a\\|b | text |\n\n```js\nconst s = "a\\nb"\n```\n'
+      for (const theme of ['elegant','bear','custom:template.css']) {
+        await setTheme(theme, theme.startsWith('custom:') ? readFileSync(join(ROOT,'themes/template.css'),'utf8') : undefined)
+        await setDoc(source)
+        check(`${theme} 正文与表格转义竖线使用正文色`, await evaluate(`(() => {
+          const walker=document.createTreeWalker(v.contentDOM,NodeFilter.SHOW_TEXT);let node,seen=0;
+          while(node=walker.nextNode()) {
+            if(!node.textContent.includes('|')||node.parentElement.closest('.cm-md-codeblock,.cm-md-marker,.cm-md-table-marker'))continue;
+            const range=document.createRange();range.selectNodeContents(node);
+            if(!range.getBoundingClientRect().width)continue;
+            seen++;if(getComputedStyle(node.parentElement).color!==getComputedStyle(v.contentDOM).color)return false;
+          }
+          return seen>=2;
+        })()`))
+        const codeColors = await evaluate(`(() => {
+          const code=Array.from(v.contentDOM.querySelectorAll('.cm-md-codeblock')).find(line=>line.textContent.includes('const s'));
+          const walker=document.createTreeWalker(code,NodeFilter.SHOW_TEXT);let node,escape;
+          while(node=walker.nextNode())if(node.textContent.includes('\\\\n'))escape=node.parentElement;
+          if(!escape)return {found:false,html:code?.outerHTML};
+          const sample=document.createElement('span');sample.style.color=getComputedStyle(code).getPropertyValue('--code-string');document.body.appendChild(sample);
+          const expected=getComputedStyle(sample).color;sample.remove();
+          return {found:true,actual:getComputedStyle(escape).color,expected,html:code.outerHTML};
+        })()`);
+        check(`${theme} 代码块字符串转义仍保留代码语法色`, codeColors.found && codeColors.actual===codeColors.expected, JSON.stringify(codeColors))
+      }
+    },
+    async pdf() {
+      const source = '# 分页表格\n\n| 行号 | 内容 | 金额 |\n| --- | --- | ---: |\n' +
+        Array.from({length:60}, (_, index) => {
+          const id = String(index + 1).padStart(3, '0')
+          return `| R${id} | BEGIN${id} ${'长行内容 mixed words '.repeat((index + 1) % 10 === 0 ? 17 : 1)}END${id} | ${index + 1}.45 |`
+        }).join('\n') + '\n\nPDFEND060\n'
+      await setTheme('writer')
+      await setDoc(source)
+      const out = join(dir, 'table-rows.pdf')
+      await mainEval(`(() => {
+        const {BrowserWindow,dialog}=${ELECTRON};
+        globalThis.originalPDFSave=dialog.showSaveDialog;
+        globalThis.originalPDFShow=BrowserWindow.prototype.show;
+        globalThis.originalPDFFocus=BrowserWindow.prototype.focus;
+        dialog.showSaveDialog=async()=>({canceled:false,filePath:${JSON.stringify(out)}});
+        BrowserWindow.prototype.show=function(){};BrowserWindow.prototype.focus=function(){};
+      })()`)
+      try {
+        await sendToWindow('menu-export-pdf')
+        for(let i=0;i<300&&!existsSync(out);i++) await sleep(100)
+        check('真实菜单 PDF 导出成功', existsSync(out))
+        const pdf = readFileSync(out).toString('latin1')
+        check('长表格实际导出多页 PDF', (pdf.match(/\/Type\s*\/Page(?!s)/g) ?? []).length > 1)
+        // 字体子集把文本编码成字形号，不能在 PDF 二进制中直接查行标记。
+        // 本机有 Poppler 时逐页提取，证明同一行的首尾没有落到不同页。
+        const extracted = spawnSync('pdftotext', ['-layout', out, '-'], {encoding:'utf8'})
+        if (extracted.error?.code === 'ENOENT') {
+          console.log('SKIP PDF 逐页行标记核对：未安装 pdftotext；保留真实 PDF 产物与打印规则检查')
+        } else {
+          check('PDF 文本可解析', extracted.status === 0, extracted.stderr)
+          const pages = extracted.stdout.split('\f')
+          if (pages.at(-1) === '') pages.pop()
+          check('PDF 每页有正文且文末标记在最后一页', pages.every(page => page.trim()) && pages.at(-1).includes('PDFEND060'))
+          const failures = []
+          for(let row=1;row<=60;row++) {
+            const id = String(row).padStart(3,'0')
+            const begin = pages.flatMap((page,index)=>page.includes('BEGIN'+id)?[index]:[])
+            const end = pages.flatMap((page,index)=>page.includes('END'+id)?[index]:[])
+            if(begin.length!==1||end.length!==1||begin[0]!==end[0]) failures.push({row,begin,end})
+          }
+          check('真实 PDF 六十行首尾完整且不跨页', failures.length===0, JSON.stringify(failures))
+        }
+        await send('Emulation.setEmulatedMedia', {media:'print'})
+        check('打印排版把表格行作为不可拆分单元', await evaluate(`(() => {const rows=Array.from(document.querySelectorAll('.cm-md-table-row'));return rows.length>1&&rows.every(row=>getComputedStyle(row).breakInside==='avoid')})()`))
+        check('PDF 导出不修改原文', await doc()===source)
+        check('打印副本在导出结束后移除', await evaluate(`!document.querySelector('.colamd-print-copy')`))
+      } finally {
+        await send('Emulation.setEmulatedMedia', {media:''})
+        await mainEval(`(() => {const {BrowserWindow,dialog}=${ELECTRON};dialog.showSaveDialog=originalPDFSave;BrowserWindow.prototype.show=originalPDFShow;BrowserWindow.prototype.focus=originalPDFFocus})()`)
+      }
     },
     async image() {
       await setTheme('elegant')
@@ -1593,7 +1676,7 @@ try {
   check('放映保持表格列布局和页码', await evaluate(`getComputedStyle(document.querySelector('.cm-md-table-header')).display === 'table-row' && document.querySelector('.cm-md-table-widget:has(.cm-md-table-row)').classList.contains('cm-md-page-0')`))
   await evaluate(`document.body.classList.remove('presenting')`)
   await evaluate('window.__colamdPrintExport.enter()')
-  check('图片和 PDF 布局仍保留表格', await evaluate(`document.querySelectorAll('.cm-md-table-row').length`) === 4)
+  check('PDF 布局保留编辑器原表格和原生打印副本', await evaluate(`v.contentDOM.querySelectorAll('.cm-md-table-row').length === 4 && document.querySelectorAll('.colamd-print-copy table .cm-md-table-row').length === 4`))
   await evaluate('window.__colamdPrintExport.exit()')
   check('导出不改变原文', await doc() === fixture)
   await sleep(1200)

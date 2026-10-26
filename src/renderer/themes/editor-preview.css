@@ -220,6 +220,7 @@
 /* 逐行加底色，首末行加圆角，拼出整块的外形（旧版 pre 是 16px 内边距、圆角 6px）。
  * 不用真 <pre> 是因为 CM6 的行是一个个 div，插不了包住多行的元素。 */
 .cm-content .cm-md-codeblock {
+  --syntax-escape: var(--code-string);
   /* 底色本身在 ::before 上，位置因此需要 relative（见下一条）。 */
   position: relative;
   color: var(--code-block-text, var(--text-color));
@@ -621,6 +622,10 @@ body.exporting .cm-content .cm-md-frontmatter {
   .cm-content .cm-md-frontmatter {
     display: none !important;
   }
+
+  /* 装饰行不是原生 tr，必须显式保持一行在同一张纸上。
+   * 否则 Chromium 会把同一格的首尾文字分到相邻两页。 */
+  .cm-content .cm-md-table-row { break-inside: avoid; }
 
   /* 纸比窗口窄，打印时脚本不会重排：列宽按屏幕上的占比缩小，数字放不下就拆行，不裁到纸外。
    * 代价是屏幕上刚好放下的金额在纸上也可能拆成两行，比被裁掉好 */
