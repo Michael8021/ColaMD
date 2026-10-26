@@ -1,4 +1,4 @@
-import { Annotation, ChangeSet, Compartment, EditorSelection, EditorState, Prec, StateEffect, StateField, Transaction, type ChangeSpec, type Line, type Range, type TransactionSpec } from '@codemirror/state'
+import { type SelectionRange, Annotation, ChangeSet, Compartment, EditorSelection, EditorState, Prec, StateEffect, StateField, Transaction, type ChangeSpec, type Line, type Range, type TransactionSpec } from '@codemirror/state'
 import { BlockWrapper, Decoration, EditorView, ViewPlugin, WidgetType, keymap, type DecorationSet, type Rect, type ViewUpdate } from '@codemirror/view'
 import { syntaxTree } from '@codemirror/language'
 import { invertedEffects, isolateHistory, redo, selectAll, undo } from '@codemirror/commands'
@@ -1420,6 +1420,39 @@ function cellAtPoint(view: EditorView, event: Pick<MouseEvent, 'clientX' | 'clie
   return { pos: head, from: cell.start, to: cell.end, assoc: head === cell.end ? -1 : 1 }
 }
 
+/** 表格与引用的分隔只承载块间距。顶层其它普通分隔交给 paragraph-layout。
+ * 只检查目标空行及其邻接块，不重建段落装饰；代码内、文档边界和真实空段仍可编辑。 */
+function navigationSeparator(state: EditorState, line: Line): boolean {
+  if (!blankLine(line.text)) return false
+  const context = (pos: number): 'quote' | 'table' | null => {
+    let quote = false, table = false
+    for (let node: SyntaxNode | null = syntaxTree(state).resolveInner(pos, -1); node; node = node.parent) {
+      if (node.name === 'FencedCode' || node.name === 'CodeBlock' || node.name === 'HTMLBlock') return null
+      quote ||= node.name === 'Blockquote'
+      table ||= node.name === 'Table'
+    }
+    return table ? 'table' : quote ? 'quote' : null
+  }
+  let before = line.number - 1, after = line.number + 1
+  while (before > 0 && blankLine(state.doc.line(before).text)) before--
+  while (after <= state.doc.lines && blankLine(state.doc.line(after).text)) after++
+  if (!before || after > state.doc.lines || after - before > 3) return false
+  if (line.text.includes('>')) return context(line.to) === 'quote'
+  return !!(context(state.doc.line(before).to) || context(state.doc.line(after).to))
+}
+
+/** 公开几何移动先尊重其它扩展的 atomic 跳过，再对实际落到的分隔继续移动。 */
+function movePastSeparators(view: EditorView, range: SelectionRange, direction: 1 | -1, moved = view.moveVertically(range, direction > 0)): SelectionRange {
+  const caret = view.coordsAtPos(range.head, range.assoc || direction)
+  const goal = range.goalColumn ?? (caret ? caret.left - view.contentDOM.getBoundingClientRect().left : undefined)
+  while (navigationSeparator(view.state, view.state.doc.lineAt(moved.head))) {
+    const next = view.moveVertically(EditorSelection.cursor(moved.head, direction, undefined, goal), direction > 0)
+    if (direction > 0 ? next.head <= moved.head : next.head >= moved.head) break
+    moved = next
+  }
+  return EditorSelection.cursor(moved.head, moved.assoc, undefined, goal)
+}
+
 function moveVertical(view: EditorView, direction: 1 | -1, extend = false): boolean {
   if (returnFromParagraph(view, direction)) return true
   const current = currentCell(view.state)
@@ -1440,14 +1473,16 @@ function moveVertical(view: EditorView, direction: 1 | -1, extend = false): bool
     if (extend) return false
     // 原生移动可能停在列表/引用的隐藏标记内部；只归一化这类不可见前缀，
     // 其余正文与软换行仍交给 CM 的公开移动规则。
-    const moved = view.moveVertically(range, direction > 0)
+    const native = view.moveVertically(range, direction > 0)
+    const moved = movePastSeparators(view, range, direction, native)
     const line = view.state.doc.lineAt(moved.head)
     const start = textStart(line)
     let node: SyntaxNode | null = syntaxTree(view.state).resolveInner(Math.min(start, line.to), -1)
     while (node && node.name !== 'Blockquote' && node.name !== 'ListItem' && !/^ATXHeading/.test(node.name)) node = node.parent
-    if (node && moved.head < start) {
-      view.dispatch({ selection: EditorSelection.create([extend ? EditorSelection.range(range.anchor, start, moved.goalColumn)
-        : EditorSelection.cursor(start, 1, undefined, moved.goalColumn)]), userEvent: 'select', scrollIntoView: true })
+    const skipped = moved.head !== native.head
+    if (skipped || node && moved.head < start) {
+      view.dispatch({ selection: EditorSelection.create([extend ? EditorSelection.range(range.anchor, Math.max(start, moved.head), moved.goalColumn)
+        : EditorSelection.cursor(Math.max(start, moved.head), 1, undefined, moved.goalColumn)]), userEvent: 'select', scrollIntoView: true })
       return true
     }
     return false
@@ -1472,9 +1507,8 @@ function moveVertical(view: EditorView, direction: 1 | -1, extend = false): bool
       if (direction < 0 ? boundary.number === 1 : boundary.number === view.state.doc.lines) {
         if (!extend) { leaveTable(view, table, direction); return true }
       }
-      // 方向键按真实可见行移动，包括引用空行。Tab/Enter 的离表输入规则
-      // 才需要跨过分隔空行；不能把它用于单纯的上下浏览。
-      const moved = view.moveVertically(range, direction > 0)
+      // 浏览与 Tab/Enter 都跨过分隔；方向键仍由真实几何保留目标横坐标。
+      const moved = movePastSeparators(view, range, direction)
       pos = Math.max(textStart(view.state.doc.lineAt(moved.head)), moved.head)
     } else {
       const target = table.rows[next].cells[column]
@@ -1624,7 +1658,7 @@ export const tableEditing = [
   tableField,
   tableGeometry.of([]),
   tableLayout,
-  // 方向键允许落在表外的真实分隔行。首次输入时保留这条分隔，避免正文被
+  // 点击仍可落在表外的分隔行。首次输入时保留这条分隔，避免正文被
   // Markdown 重新解析成表格行；纯导航不写源码。续引用与普通输入共用此规则。
   EditorState.transactionFilter.of(tr => {
     if (!tr.docChanged || !tr.isUserEvent('input') || tr.annotation(tableEdit) || tr.startState.field(tableComposition, false)) return tr

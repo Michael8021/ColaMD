@@ -54,8 +54,8 @@ export async function verifyCursorQuote({ evaluate, send, key, setDoc, type, che
   }
   try {
     for(const [label,doc,lines] of [
-      ['引用表格',quote,[1,3,4,5,6,7,8]],
-      ['列表边界','- 列表起点\n\n'+quote+'\n\n- 列表终点',[3,5,6,7,8,9,10,11,12]],
+      ['引用表格',quote,[1,3,4,6,8]],
+      ['列表边界','- 列表起点\n\n'+quote+'\n\n- 列表终点',process.env.CURSOR_QUOTE_WITH_PARAGRAPH ? [3,5,6,8,10,12] : [3,5,6,8,10,11,12]],
     ]){
       await setDoc(doc)
       for(const change of ['初始','格内输入','引用Enter','撤销','滚动','缩窗']){
@@ -69,8 +69,17 @@ export async function verifyCursorQuote({ evaluate, send, key, setDoc, type, che
       await mainEval(`${ELECTRON}.BrowserWindow.getAllWindows()[0].setContentSize(1200,900)`)
     }
     await setDoc(quote)
-    await walk('引用表格/第二列',[1,3,4,5,6,7,8],'数量',1)
-    await walk('引用表格/第三列',[1,3,4,5,6,7,8],'备注',2)
+    await walk('引用表格/第二列',[1,3,4,6,8],'数量',1)
+    await walk('引用表格/第三列',[1,3,4,6,8],'备注',2)
+    for (const [label, source, lines, title] of [
+      ['普通表格双侧', '前段。\n\n| 名称 | 数量 |\n|---|---|\n| 苹果 | 2 |\n\n后段。', [3,5,7], '名称'],
+      ['两条表格分隔', '前段。\n\n\n| 名称 | 数量 |\n|---|---|\n| 苹果 | 2 |\n\n\n后段。', [4,6,9], '名称'],
+      ['无表格引用', '> 引用甲。\n>\n> 引用乙。\n\n外段。', [1,3,5], '引用甲'],
+      ['引用代码空行保留', '> ```\n> 引用甲。\n>\n> 引用乙。\n> ```', [2,3,4], '引用甲'],
+    ]) {
+      await setDoc(source)
+      await walk(label, lines, title)
+    }
     // 从虚拟视口中部进入多表长文，覆盖分隔行成为 wrapper 首个可见子行的情况。
     const prefix=Array.from({length:24},(_,i)=>`段落${i}\n\n| H | V |\n|---|---|\n| 前表${i} | value |\n\n`).join('')
     await setDoc(prefix+quote+'\n\n'+Array.from({length:60},(_,i)=>`尾段${i}`).join('\n\n'))
@@ -78,7 +87,7 @@ export async function verifyCursorQuote({ evaluate, send, key, setDoc, type, che
       await click('试末格');await click('引用内的后续段落');await click('引用甲');await type('编辑');await key('Backspace');
       await evaluate('v.scrollDOM.scrollTop+=700');await wait(100)
       await click('试末格')
-      const errors=await evaluate(`(()=>{const rows=[...v.contentDOM.querySelectorAll('.cm-line')].filter(n=>n.getBoundingClientRect().height>0);return rows.map(n=>{const p=v.posAtDOM(n,0),b=n.getBoundingClientRect(),h=v.lineBlockAt(p);return {line:v.state.doc.lineAt(p).number,delta:b.top-(v.documentTop+h.top)}}).filter(r=>Math.abs(r.delta)>8)})()`)
+      const errors=await evaluate(`(()=>{const rows=[...v.contentDOM.querySelectorAll('.cm-line')].filter(n=>n.getBoundingClientRect().height>0);return rows.map(n=>{const p=v.posAtDOM(n,0),b=n.getBoundingClientRect(),block=v.lineBlockAt(p),h=Array.isArray(block.type)?block.type.find(part=>part.type===0&&part.from<=p&&part.to>=p)??block:block;return {line:v.state.doc.lineAt(p).number,delta:b.top-(v.documentTop+h.top)}}).filter(r=>Math.abs(r.delta)>8)})()`)
       record('长文高度表 '+cycle,errors.length===0,{errors})
     }
     if(process.env.CURSOR_QUOTE_MANUAL_FIXTURE) {
@@ -86,9 +95,9 @@ export async function verifyCursorQuote({ evaluate, send, key, setDoc, type, che
       await setDoc(manual)
       await mainEval(`${ELECTRON}.BrowserWindow.getAllWindows()[0].setContentSize(1200,900)`)
       for(const [section,title,offsets] of [
-        ['21','名称',[0,2,3,4,5,6,7]],
-        ['22','名称',[0,2,3,4,5]],
-        ['23','名称',[0,2,3,4,5]],
+        ['21','名称',[0,2,3,5,7]],
+        ['22','名称',[0,2,3,5]],
+        ['23','名称',[0,2,3,5]],
         ['24','项目',[0,2,3]],
       ]) {
         const start=await evaluate(`(()=>{const s=v.state.doc.toString(),at=s.indexOf('## ${section} '),p=s.indexOf('| ${title}',at);return v.state.doc.lineAt(p).number})()`)
