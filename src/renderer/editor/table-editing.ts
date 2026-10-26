@@ -481,6 +481,7 @@ function tableLayoutSnapshot(table: MarkdownTable, layout: TableLayout): TableLa
 
 const tableLayout = ViewPlugin.fromClass(class {
   readonly id = String(++tableLayoutId)
+  private readonly printMedia = window.matchMedia('print')
   private readonly style = document.createElement('style')
   private readonly measure = document.createElement('div')
   private readonly canvas = document.createElement('canvas').getContext('2d')!
@@ -589,7 +590,9 @@ const tableLayout = ViewPlugin.fromClass(class {
 
   private schedule(): void {
     this.view.requestMeasure({ key: this, read: view => {
-      if (view.state.field(tableComposition, false)) return null
+      // 打印分页期间重写屏幕百分比列宽会改变已分片表格的几何，可能丢掉末行。
+      // 纸面由 print CSS 独立布局，屏幕测量与规则在退出打印后继续复用。
+      if (this.printMedia.matches || view.state.field(tableComposition, false)) return null
       for (const probe of this.probes) this.metrics.set(probe.key, { min: probe.min.getBoundingClientRect().width, max: probe.max.getBoundingClientRect().width })
       const sample = view.contentDOM.querySelector<HTMLElement>('.cm-md-table-cell')
       if (!sample) {
@@ -718,6 +721,7 @@ const tableLayout = ViewPlugin.fromClass(class {
       if (usedMetrics.size) for (const key of this.metrics.keys()) if (!usedMetrics.has(key)) this.metrics.delete(key)
       return { doc: view.state.doc, layouts, wrapping, checked, pending: [...pending].map(([key, value]) => ({ key, ...value })) }
     }, write: plan => {
+      if (this.printMedia.matches) return
       this.measure.replaceChildren()
       this.probes = []
       if (!plan || plan.doc !== this.view.state.doc) return

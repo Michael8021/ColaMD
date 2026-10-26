@@ -507,12 +507,17 @@ try {
           check('PDF 短编号完整不拆行', Array.from({length:60}, (_,i)=>'R'+String(i+1).padStart(3,'0')).every(id=>extracted.stdout.includes(id)))
           check('跨页表格逐页重复表头且表头不孤立', pages.every(page => !/BEGIN\d{3}/.test(page) || /行号/.test(page.replace(/\s/g,'')) && /内容/.test(page.replace(/\s/g,''))))
         }
+        const screenRules = await evaluate(`document.querySelector('.cm-editor > style')?.textContent`)
         await send('Emulation.setEmulatedMedia', {media:'print'})
+        await mainEval(`${ELECTRON}.BrowserWindow.getAllWindows()[0].setContentSize(700,800)`)
+        await sleep(150)
+        check('打印媒体重排不改写屏幕列宽规则', await evaluate(`document.querySelector('.cm-editor > style')?.textContent`) === screenRules)
         check('打印排版把表格行作为不可拆分单元', await evaluate(`(() => {const rows=Array.from(document.querySelectorAll('.cm-md-table-row'));return rows.length>1&&rows.every(row=>getComputedStyle(row).breakInside==='avoid')})()`))
         check('PDF 导出不修改原文', await doc()===source)
         check('PDF 不创建打印副本', await evaluate(`!document.querySelector('.colamd-print-copy')`))
       } finally {
         await send('Emulation.setEmulatedMedia', {media:''})
+        await mainEval(`${ELECTRON}.BrowserWindow.getAllWindows()[0].setContentSize(1200,900)`)
         await mainEval(`(() => {const {BrowserWindow,dialog}=${ELECTRON};dialog.showSaveDialog=originalPDFSave;BrowserWindow.prototype.show=originalPDFShow;BrowserWindow.prototype.focus=originalPDFFocus})()`)
       }
     },

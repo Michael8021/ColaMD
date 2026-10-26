@@ -633,9 +633,9 @@ body.exporting .cm-content .cm-md-frontmatter {
     display: none !important;
   }
 
-  /* 页边距已经由 @page 提供。屏幕的内边距和 min-height 会额外缩窄表格，
-   * 还可能把文末之后的编辑留白推成空白页。 */
-  body.paper #editor .cm-content { width: 100% !important; min-height: 0 !important; padding: 0 !important; }
+  /* 保留与正文相同的内边距；@page 的页边距在它之外。
+   * 只移除编辑区最小高度，避免将文末编辑留白带成空白末页。 */
+  body.paper #editor .cm-content { min-height: 0 !important; }
   /* 纸面按内容重新分配列宽，不沿用屏幕的百分比。数字也参与换行后的
    * min-content 计算，长数字不能再独占最小宽度，短编号由格子下限保护。 */
   .cm-content .cm-md-table-widget { table-layout: auto; }
