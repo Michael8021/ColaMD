@@ -886,7 +886,11 @@ function collectBlocks(state: EditorState, ranges: DecorationRange[], front: Ran
   iterateContent(state, front, (node) => {
     switch (node.name) {
       case 'Blockquote': {
-        pushBlockLines(state, node.from, node.to, 'cm-md-blockquote', ranges)
+        // Lezer 的块终点可能停在最后一段正文；显式空引用行仍属于这个块，
+        // 尤其是刚按 Enter 补出的 `> `。不把下一条普通空行算进引用。
+        let end = state.doc.lineAt(node.to).number
+        while (end < state.doc.lines && /^[ \t]*(?:>[ \t]*)+$/.test(state.doc.line(end + 1).text)) end++
+        pushBlockLines(state, node.from, state.doc.line(end).to, 'cm-md-blockquote', ranges)
         break
       }
       case 'HorizontalRule': {

@@ -132,6 +132,32 @@ try {
   // 每个缺陷可单独运行，避免首条失败挡住其余修复前证据。
   const regression = process.argv.find(arg => arg.startsWith('--regression='))?.split('=')[1]
   const regressions = {
+    async adjacentParagraph() {
+      for (const prefix of ['', '> ']) for (const direction of ['ArrowUp','ArrowDown']) {
+        const source = `${prefix}前文\n${prefix.trimEnd()}\n${prefix}| A | B |\n${prefix}|---|---|\n${prefix}| text | value |\n${prefix.trimEnd()}\n${prefix}后文\n`
+        await setDoc(source)
+        await select(direction==='ArrowUp'?'A':'value')
+        await key(direction)
+
+        const line=await evaluate('v.state.doc.lineAt(v.state.selection.main.head).number')
+        check(`${prefix?'引用':'普通'}${direction} 落在实际分隔行`,line===(direction==='ArrowUp'?2:6))
+        await type('正文')
+        check('分隔行首次输入仍保留原表格',await evaluate(`v.contentDOM.querySelectorAll('.cm-md-table-row').length===2 && v.state.doc.toString().includes('正文')`),await doc())
+        await key('z',MOD)
+        check('相邻段落输入与分隔一步撤销',await doc()===source,await doc())
+        await send('Input.imeSetComposition',{text:'zhong',selectionStart:5,selectionEnd:5})
+        await send('Input.insertText',{text:'中文'})
+        await sleep(100)
+        check('相邻分隔行中文输入保留表格',await evaluate(`v.contentDOM.querySelectorAll('.cm-md-table-row').length===2 && v.state.doc.toString().includes('中文')`),await doc())
+        await send('Input.imeSetComposition',{text:'',selectionStart:0,selectionEnd:0})
+        // 结束 CDP 组字会话后，下一夹具再恢复普通方向键导航。
+        for(let wait=0;wait<30&&await evaluate('v.composing');wait++)await sleep(30)
+      }
+    },
+    async cursorQuote() {
+      const { verifyCursorQuote } = await import('./verify-cursor-quote.mjs')
+      await verifyCursorQuote({ evaluate, send, key, setDoc, type, check, mainEval, ELECTRON })
+    },
     async empty() {
       const original = '| A | B |\n|---|---|\n|   | `c|d` |\n'
       await setDoc(original)
@@ -1365,8 +1391,14 @@ try {
   await mainEval(`(async () => { const { clipboard, ClipboardItem } = ${ELECTRON}; globalThis.__tablesClipboard = await Promise.all((await clipboard.read()).map(async item => new ClipboardItem(Object.fromEntries(await Promise.all(item.types.map(async type => [type, await item.getType(type)])))))) })()`)
   try {
     await select('果 | 12', 0, '果 | 12'.length)
-    await evaluate(`document.execCommand('copy')`)
-    const system = await mainEval(`(async () => { const items = await ${ELECTRON}.clipboard.read(); const get = async type => { const item = items.find(item => item.types.includes(type)); return item ? (await item.getType(type)).text() : '' }; return { text: await get('text/plain'), html: await get('text/html') } })()`)
+    // 隐藏窗口 execCommand 可静默返回 false；使用应用实际的原生复制入口。
+    await mainEval(`${ELECTRON}.BrowserWindow.getAllWindows()[0].webContents.copy()`)
+    let system
+    for (let attempt = 0; attempt < 30; attempt++) {
+      system = await mainEval(`(async () => { const items = await ${ELECTRON}.clipboard.read(); const get = async type => { const item = items.find(item => item.types.includes(type)); return item ? (await item.getType(type)).text() : '' }; return { text: await get('text/plain'), html: await get('text/html') } })()`)
+      if (system.text === '果 | 12' && system.html.includes('<td')) break
+      await sleep(50)
+    }
     check('系统剪贴板拿到原文和一行表格', system.text === '果 | 12' && system.html.includes('<td style="text-align:left">果</td><td style="text-align:right">12</td>'), JSON.stringify(system))
     await setDoc('正文\n')
     await select('正文', 2)
@@ -1459,18 +1491,18 @@ try {
   const previous = await evaluate('v.state.selection.main.head')
   check('上移进入上一格的最后一行', previous >= wrapped.indexOf('second') && previous <= wrapped.indexOf('second') + 6, previous)
   check('上下移动不改变多行单元格', await doc() === wrapped)
-  // 表格后紧挨着的一行会被并进表格，离开时要落到隔着空行的正文上
+  // 上下浏览逐行停在分隔行；实际输入时保留必要的 Markdown 分隔。
   const between = '前文\n\n| A | B |\n|---|---|\n| text | value |\n\n## 后文\n'
   await setDoc(between)
   await select('value', 5)
   await key('ArrowDown')
   await type('新')
-  check('下方向键离开表格落到下一块正文', await doc() === between.replace('## 后文', '## 新后文') && await evaluate(`document.querySelectorAll('.cm-md-table-row').length`) === 2, await doc())
+  check('下方向键落到真实空行，输入时保留表格分隔', await doc() === between.replace('\n\n## 后文', '\n\n新\n## 后文') && await evaluate(`document.querySelectorAll('.cm-md-table-row').length`) === 2, await doc())
   await setDoc(between)
   await select('A', 1)
   await key('ArrowUp')
   await type('新')
-  check('上方向键离开表格落到上一段末尾', await doc() === between.replace('前文', '前文新'), await doc())
+  check('上方向键落到表格前的真实空行', await doc() === between.replace('前文\n\n', '前文\n新\n\n'), await doc())
   await setDoc(between)
   await select('value', 5)
   await key('Enter', MOD)
@@ -1487,7 +1519,7 @@ try {
   await select('y', 1)
   await key('ArrowDown')
   await type('新')
-  check('引用里的表格向下离开落在引用正文前', await doc() === quoted.replace('引用结尾', '新引用结尾'), await doc())
+  check('引用里的表格向下落在空引用行，输入时保留分隔', await doc() === quoted.replace('>\n> 引用结尾', '>\n>新\n> 引用结尾'), await doc())
   const spaced = '| A | B |\n|---|---|\n|  | x |\n'
   await setDoc(spaced)
   await clickCell(1, 0)
@@ -1539,7 +1571,7 @@ try {
   check('文首正文撤销后继续输入不进入表头', await doc() === '文首继续\n\n' + noNewline + '\n', await doc())
   await key('z', MOD)
   await select('value', 5)
-  await key('ArrowDown')
+  await key('ArrowRight')
   await send('Input.imeSetComposition', { text: 'zhong', selectionStart: 5, selectionEnd: 5 })
   check('表外临时段落的输入法预编辑不改文档', await doc() === noNewline + '\n', await doc())
   await send('Input.imeSetComposition', { text: '', selectionStart: 0, selectionEnd: 0 })
@@ -1547,7 +1579,7 @@ try {
   await clickCell(1, 0)
   check('点击表格取消临时段落且不改文档', await doc() === noNewline + '\n' && !await evaluate(`!!document.querySelector('.cm-md-table-paragraph-input')`), await doc())
   await select('value', 5)
-  await key('ArrowDown')
+  await key('ArrowRight')
   await evaluate(`v.setState(v.state)`)
   await sleep(50)
   check('恢复标签状态取消临时段落并返回原单元格', await doc() === noNewline + '\n' && !await evaluate(`!!document.querySelector('.cm-md-table-paragraph-input')`) && await head() === noNewline.indexOf('value') + 5, await doc())

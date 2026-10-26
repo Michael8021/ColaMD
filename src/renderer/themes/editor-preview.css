@@ -304,7 +304,10 @@
   border-spacing: 0;
   table-layout: auto;
   box-sizing: border-box;
-  margin: 0.25em 0;
+  /* 外边距不在 BlockWrapper 的 rect 内，CM 无法把它计入高度表。
+   * 用内边距让首尾留白参与同一次测量，避免多表滚动累计坐标偏差。 */
+  margin: 0;
+  padding-block: 0.25em;
 }
 
 /* 引用里的表格外框带着引用竖线，上下留白改用内边距，竖线才不会在表格上下断开 */
@@ -367,9 +370,16 @@
   font-size: 0;
 }
 
+/* 分隔行必须保留在表格中的零高几何锚点。display:none 的 rect 是 (0,0)，
+ * 当虚拟视口从分隔行起步时，BlockWrapper 会把它到外框的距离误算成上留白。 */
 .cm-content .cm-md-table-delimiter {
-  display: none;
+  display: table-row;
+  height: 0;
+  font-size: 0;
+  line-height: 0;
+  visibility: hidden;
 }
+.cm-content .cm-md-table-delimiter > * { display: none; }
 
 .cm-md-table-widget > .cm-gap { display: table-row; }
 .cm-content .cm-md-table-row > .cm-widgetBuffer { display: none; }

@@ -175,6 +175,8 @@ interface TableParagraph {
   side: -1 | 1
   gap: string
   returnTo: number
+  /** 引用边界落点继续向外导航时也收起。 */
+  dismissOutward?: boolean
 }
 
 /** 文档边界外的临时输入位置。只有确认输入后才把段落写进源码。 */
@@ -903,7 +905,7 @@ function insertParagraphText(view: EditorView, text: string): boolean {
 function returnFromParagraph(view: EditorView, direction: number): boolean {
   const paragraph = pendingParagraph(view.state)
   if (!paragraph) return false
-  if (!direction || direction === -paragraph.side) {
+  if (!direction || direction === -paragraph.side || paragraph.dismissOutward) {
     view.dispatch({ selection: { anchor: paragraph.returnTo }, effects: setTableParagraph.of(null), userEvent: 'select', scrollIntoView: true })
     view.focus()
   }
@@ -945,13 +947,13 @@ function cellAssoc(cell: TableCell | undefined, head: number): -1 | 0 | 1 {
   return head === cell.end ? -1 : head === cell.start ? 1 : 0
 }
 
-function selectCell(view: EditorView, table: MarkdownTable, row: number, column: number, select = true): void {
+function selectCell(view: EditorView, table: MarkdownTable, row: number, column: number, select = true, goalColumn?: number): void {
   const target = table.rows[row]
   const cell = target.cells[column]
   const from = cell?.start ?? target.to
   const to = select ? (cell?.end ?? target.to) : from
   view.dispatch({
-    selection: from === to ? EditorSelection.create([EditorSelection.cursor(from, cellAssoc(cell, from))]) : EditorSelection.single(from, to),
+    selection: from === to ? EditorSelection.create([EditorSelection.cursor(from, cellAssoc(cell, from), undefined, goalColumn)]) : EditorSelection.single(from, to),
     effects: setVirtualCell.of({ row: target.from, column }),
     scrollIntoView: true,
   })
@@ -986,6 +988,18 @@ function insertRow(view: EditorView, below = true, targetColumn?: number): boole
 
 /** 空行。引用里的空行只剩 `>`。 */
 const blankLine = (text: string) => /^[\s>]*$/.test(text)
+
+/** 分隔行相邻的表格位于哪一侧。源码解析归属是判断依据，渲染类不参与。 */
+function adjacentTable(state: EditorState, line: Line): -1 | 1 | 0 {
+  if (!blankLine(line.text)) return 0
+  if (line.number > 1) {
+    const above = state.doc.line(line.number - 1)
+    const row = rowNodeAt(state, above.to)
+    if (row && row.parent!.to === above.to) return -1
+  }
+  if (line.number < state.doc.lines && rowNodeAt(state, state.doc.line(line.number + 1).to)?.name === 'TableHeader') return 1
+  return 0
+}
 
 /** 行里正文开始的地方：跳过引用、列表与标题的标记，免得字打进被藏起来的标记前面。 */
 const textStart = (line: Line) => line.from + /^[ \t>]*(?:(?:[-*+]|\d+[.)]|#{1,6})[ \t]+)?/.exec(line.text)![0].length
@@ -1406,10 +1420,39 @@ function cellAtPoint(view: EditorView, event: Pick<MouseEvent, 'clientX' | 'clie
 function moveVertical(view: EditorView, direction: 1 | -1, extend = false): boolean {
   if (returnFromParagraph(view, direction)) return true
   const current = currentCell(view.state)
-  if (!current) return false
+  if (!current) {
+    const range = view.state.selection.main
+    const first = view.state.doc.line(1)
+    const caret = view.coordsAtPos(range.head)
+    const firstStart = view.coordsAtPos(textStart(first))
+    if (direction < 0 && !extend && range.empty && range.head <= first.to &&
+      /^[ \t]*>/.test(first.text) && caret && firstStart && caret.top <= firstStart.top) {
+      view.dispatch({ selection: { anchor: 0 }, effects: setTableParagraph.of({ at: 0, side: -1,
+        gap: '\n\n', returnTo: range.head, dismissOutward: true }), userEvent: 'select' })
+      focusParagraph(view)
+      return true
+    }
+    // 扩展选区必须允许包含下一行的源码起点；吸附到正文会把下一项标记
+    // 也选进去，整行删除时就会破坏列表。
+    if (extend) return false
+    // 原生移动可能停在列表/引用的隐藏标记内部；只归一化这类不可见前缀，
+    // 其余正文与软换行仍交给 CM 的公开移动规则。
+    const moved = view.moveVertically(range, direction > 0)
+    const line = view.state.doc.lineAt(moved.head)
+    const start = textStart(line)
+    let node: SyntaxNode | null = syntaxTree(view.state).resolveInner(Math.min(start, line.to), -1)
+    while (node && node.name !== 'Blockquote' && node.name !== 'ListItem' && !/^ATXHeading/.test(node.name)) node = node.parent
+    if (node && moved.head < start) {
+      view.dispatch({ selection: EditorSelection.create([extend ? EditorSelection.range(range.anchor, start, moved.goalColumn)
+        : EditorSelection.cursor(start, 1, undefined, moved.goalColumn)]), userEvent: 'select', scrollIntoView: true })
+      return true
+    }
+    return false
+  }
   const { table, row, column, cell } = current
   const range = view.state.selection.main
-  const caret = view.coordsAtPos(range.head)
+  const caret = view.coordsAtPos(range.head, range.assoc || 1)
+  const goal = range.goalColumn ?? (caret ? caret.left - view.contentDOM.getBoundingClientRect().left : undefined)
   const edge = cell && view.coordsAtPos(direction < 0 ? cell.start : cell.end, direction)
   const element = (r: number) => view.contentDOM.querySelector<HTMLElement>(`${tableDOMSelector(view.state, table.from)} [data-table-row="${r}"] [data-column="${column}"]`)
   const own = element(row)
@@ -1422,16 +1465,19 @@ function moveVertical(view: EditorView, direction: 1 | -1, extend = false): bool
   if (pos === null || pos === range.head) {
     const next = row + direction
     if (next < 0 || next >= table.rows.length) {
-      if (!extend) {
-        leaveTable(view, table, direction)
-        return true
+      const boundary = view.state.doc.lineAt(direction < 0 ? table.from : table.to)
+      if (direction < 0 ? boundary.number === 1 : boundary.number === view.state.doc.lines) {
+        if (!extend) { leaveTable(view, table, direction); return true }
       }
-      pos = direction < 0 ? Math.max(0, view.state.doc.lineAt(table.from).from - 1) : Math.min(view.state.doc.length, table.to + 1)
+      // 方向键按真实可见行移动，包括引用空行。Tab/Enter 的离表输入规则
+      // 才需要跨过分隔空行；不能把它用于单纯的上下浏览。
+      const moved = view.moveVertically(range, direction > 0)
+      pos = Math.max(textStart(view.state.doc.lineAt(moved.head)), moved.head)
     } else {
       const target = table.rows[next].cells[column]
       view.focus()
       if ((!target || target.start === target.end) && !extend) {
-        selectCell(view, table, next, column, false)
+        selectCell(view, table, next, column, false, goal)
         return true
       }
       const el = element(next)
@@ -1441,11 +1487,11 @@ function moveVertical(view: EditorView, direction: 1 | -1, extend = false): bool
       const right = box && style ? box.right - Number.parseFloat(style.paddingRight) : 0
       const height = style ? Number.parseFloat(style.lineHeight) : 0
       const y = box && style ? (direction > 0 ? box.top + Number.parseFloat(style.paddingTop) + height / 2 : box.bottom - Number.parseFloat(style.paddingBottom) - height / 2) : 0
-      const point = box && cellAtPoint(view, { clientX: Math.max(left, Math.min(right, caret?.left ?? left)), clientY: y })
+      const point = box && cellAtPoint(view, { clientX: Math.max(left, Math.min(right, goal === undefined ? left : view.contentDOM.getBoundingClientRect().left + goal)), clientY: y })
       pos = point?.pos ?? target?.start ?? table.rows[next].to
     }
   }
-  view.dispatch({ selection: { anchor: extend ? range.anchor : pos, head: pos }, scrollIntoView: true })
+  view.dispatch({ selection: EditorSelection.create([extend ? EditorSelection.range(range.anchor, pos, goal) : EditorSelection.cursor(pos, rowNodeAt(view.state, pos) ? -1 : 1, undefined, goal)]), userEvent: 'select', scrollIntoView: true })
   return true
 }
 
@@ -1480,7 +1526,14 @@ const tableCompositionInput = ViewPlugin.fromClass(class {
       const change = cell ? cellChange(composition.start, cell, from, to, inserted.toString()) : { from, to, insert: inserted.toString() }
       if (change) changes.push(change)
     })
-    const safe = composition.start.changes(preserveTableRows(composition.start, changes, rows))
+    const separated = changes.map(change => {
+      const line = composition.start.doc.lineAt(change.from)
+      const side = change.from === change.to ? adjacentTable(composition.start, line) : 0
+      if (!side || !change.insert) return change
+      const content = line.text.slice(0, change.from - line.from) + change.insert + line.text.slice(change.to - line.from)
+      return { from: line.from, to: line.to, insert: side < 0 ? line.text + '\n' + content : content + '\n' + line.text }
+    })
+    const safe = composition.start.changes(preserveTableRows(composition.start, separated, rows))
     const repairs: TextChange[] = []
     composition.changes.invert(composition.start.doc).compose(safe).iterChanges((from, to, _next, _end, inserted) => {
       const before = view.state.sliceDoc(from, to), after = inserted.toString()
@@ -1513,7 +1566,7 @@ const tableCompositionInput = ViewPlugin.fromClass(class {
 }, {
   eventHandlers: {
     compositionstart(event) {
-      if (!(event.target instanceof HTMLElement) || event.target.closest('.cm-md-table-input') || !cellAround(this.view.state, this.view.state.selection.main.from, this.view.state.selection.main.to)) return
+      if (!(event.target instanceof HTMLElement) || event.target.closest('.cm-md-table-input') || (!cellAround(this.view.state, this.view.state.selection.main.from, this.view.state.selection.main.to) && !adjacentTable(this.view.state, this.view.state.doc.lineAt(this.view.state.selection.main.head)))) return
       this.finish()
       this.view.dispatch({ effects: setTableComposition.of(true) })
     },
@@ -1568,6 +1621,35 @@ export const tableEditing = [
   tableField,
   tableGeometry.of([]),
   tableLayout,
+  // 方向键允许落在表外的真实分隔行。首次输入时保留这条分隔，避免正文被
+  // Markdown 重新解析成表格行；纯导航不写源码。续引用与普通输入共用此规则。
+  EditorState.transactionFilter.of(tr => {
+    if (!tr.docChanged || !tr.isUserEvent('input') || tr.annotation(tableEdit) || tr.startState.field(tableComposition, false)) return tr
+    let repair: { from: number; insert: string } | undefined
+    let selection: EditorSelection | undefined
+    tr.changes.iterChanges((from, to, next, _end, text) => {
+      if (repair || from !== to || !text.length) return
+      const line = tr.startState.doc.lineAt(from)
+      const side = adjacentTable(tr.startState, line)
+      if (side < 0) {
+        repair = { from: next - (from - line.from), insert: line.text + '\n' }
+      } else if (side > 0) {
+        repair = { from: next + text.length + line.to - from, insert: '\n' + line.text }
+        selection = tr.newSelection
+      }
+    })
+    if (!repair) return tr
+    const extra = tr.newDoc.length
+    const mapping = ChangeSet.of(repair, extra)
+    return {
+      changes: tr.changes.compose(mapping),
+      selection: selection ?? tr.newSelection.map(mapping),
+      effects: tr.effects.map(effect => effect.map(mapping)).filter((effect): effect is StateEffect<unknown> => !!effect),
+      annotations: [Transaction.userEvent.of(tr.annotation(Transaction.userEvent)!),
+        Transaction.addToHistory.of(tr.annotation(Transaction.addToHistory) !== false)],
+      scrollIntoView: tr.scrollIntoView,
+    }
+  }),
   EditorState.transactionFilter.of(tr => {
     if (!tr.selection || tr.startState.field(tableComposition, false) || tr.isUserEvent('input.type.compose') || tr.effects.some(effect => effect.is(setVirtualCell))) return tr
     const range = tr.newSelection.main
@@ -1585,7 +1667,7 @@ export const tableEditing = [
     }
     const assoc = (range.empty ? cellAssoc(cell, head) : 0) || range.assoc
     if (head === range.head && assoc === range.assoc) return tr
-    const next = range.empty ? EditorSelection.cursor(head, assoc) : EditorSelection.range(range.anchor, head)
+    const next = range.empty ? EditorSelection.cursor(head, assoc, range.bidiLevel ?? undefined, range.goalColumn) : EditorSelection.range(range.anchor, head, range.goalColumn, range.bidiLevel ?? undefined, assoc)
     return [tr, { selection: tr.newSelection.replaceRange(next), sequential: true }]
   }),
   EditorState.changeFilter.of(tr => {
