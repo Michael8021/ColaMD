@@ -22,7 +22,7 @@
 // 跨行替换与块级 widget 才被允许。
 
 import { Decoration, EditorView, ViewPlugin, WidgetType, type DecorationSet, type ViewUpdate } from '@codemirror/view'
-import { EditorState, RangeSetBuilder, StateEffect, StateField, type Extension } from '@codemirror/state'
+import { EditorState, MapMode, RangeSetBuilder, StateEffect, StateField, type Extension } from '@codemirror/state'
 import { forceParsing, syntaxTree } from '@codemirror/language'
 import type { SyntaxNode, SyntaxNodeRef } from '@lezer/common'
 import katex from 'katex'
@@ -431,13 +431,11 @@ function listDepth(node: SyntaxNode): number {
 }
 
 /** 扫描公式并压入装饰。 */
-function collectMath(state: EditorState, ranges: DecorationRange[]): void {
-  const text = state.doc.toString()
+function collectMath(state: EditorState, ranges: DecorationRange[], text: string, excluded: Excluded[]): void {
+  if (!/[$\\]/.test(text)) return
 
   // 排除区：属性区、代码块、行内代码、行内 HTML。
   // 这些地方里的 `$x$` 不该渲染成公式——代码就是代码，Obsidian 也是这么处理的。
-  const excluded: Excluded[] = excludedRanges(text, syntaxTree(state))
-
   for (const range of scanMath(text, excluded)) {
     // 块公式：光标落进去就退回源码，就地改（行内公式的判据见上，保持不露）
     if (isActiveLine(state, range.from) || (range.block && isBlockActive(state, range.from, range.to))) {
@@ -462,8 +460,8 @@ function collectMath(state: EditorState, ranges: DecorationRange[]): void {
 /** `==高亮==` 的匹配。不吃跨行，也不吃空的 `====`。 */
 const HIGHLIGHT_RE = /(?<![=])==(?!=)([^=\n]+?)==(?!=)/g
 
-function collectHighlight(state: EditorState, ranges: DecorationRange[], excluded: Excluded[]): void {
-  const text = state.doc.toString()
+function collectHighlight(state: EditorState, ranges: DecorationRange[], text: string, excluded: Excluded[]): void {
+  if (!text.includes('==')) return
   const inExcluded = (pos: number) => excluded.some((e) => pos >= e.from && pos < e.to)
 
   HIGHLIGHT_RE.lastIndex = 0
@@ -1092,7 +1090,7 @@ let currentFlash: { from: number; to: number } | null = null
 function buildDecorations(state: EditorState, flash: { from: number; to: number } | null): DecorationSet {
   const ranges: DecorationRange[] = []
   const text = state.doc.toString()
-  const excluded = excludedRanges(text, syntaxTree(state))
+  const excluded = /[$\\]|==/.test(text) ? excludedRanges(text, syntaxTree(state)) : []
   // 属性区的区间要算一次、多处用：压淡它、把它里面的 YAML 排出 markdown 排版、
   // 不让它的 `---` 被当成分页。
   const front = frontmatterRange(text)
@@ -1111,9 +1109,9 @@ function buildDecorations(state: EditorState, flash: { from: number; to: number 
   collectFrontmatter(state, ranges, front)
   collectTaskItems(state, ranges, front)
   collectMermaid(state, ranges, front)
-  collectHighlight(state, ranges, excluded)
+  collectHighlight(state, ranges, text, excluded)
   // 公式放最后：它覆盖区间，其它装饰不该插进它里面
-  collectMath(state, ranges)
+  collectMath(state, ranges, text, excluded)
 
   // 排序键必须带上 startSide：RangeSetBuilder 只接受按 (from, startSide) 递增的顺序，
   // 原来只按 (from, to) 排，同一段区间上挂了两种装饰时就翻车。
@@ -1173,12 +1171,18 @@ export const decorationsRefreshEffect = StateEffect.define<null>()
  * 插件直接崩掉（`Calls to EditorView.update are not allowed while an update is in progress`）。
  */
 const parseRefresh = ViewPlugin.fromClass(class {
-  private parsed = 0
+  private parsed: number
   private pending = false
   private attempts = 0
+  constructor(view: EditorView) {
+    this.parsed = syntaxTree(view.state).length
+  }
   update(update: ViewUpdate) {
     const tree = syntaxTree(update.state)
-    const grew = tree.length > this.parsed
+    // 先把旧终点放到新文档坐标里：输入增加的长度不是后台解析推进。
+    // 终点被替换时已没有可比较的位置，必须刷新，不能把插入区末尾当旧终点而漏掉新树。
+    const parsed = update.changes.mapPos(this.parsed, 1, MapMode.TrackDel)
+    const grew = parsed === null || tree.length > parsed
     this.parsed = tree.length
     const viewportEnd = update.view.viewport.to
     if (tree.length >= viewportEnd) {
