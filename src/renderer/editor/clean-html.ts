@@ -384,7 +384,7 @@ function isLineElement(node: Node): node is HTMLElement {
 }
 
 function tableCellsHTML(cells: HTMLElement[], tag: 'th' | 'td'): string {
-  return cells.map(cell => `<${tag} style="text-align:${cell.style.textAlign || 'left'}">${childrenHTML(cell).replace(/^[ \t]+|[ \t]+$/g, '')}</${tag}>`).join('')
+  return cells.map(cell => `<${tag} style="overflow-wrap:anywhere;word-break:normal;text-align:${cell.style.textAlign || 'left'}">${childrenHTML(cell).replace(/^[ \t]+|[ \t]+$/g, '')}</${tag}>`).join('')
 }
 
 /** 列表/引用归属与分组都读取源码行；先展开表格的布局包装，保留每行的归属信息。 */

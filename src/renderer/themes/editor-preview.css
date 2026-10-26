@@ -633,13 +633,19 @@ body.exporting .cm-content .cm-md-frontmatter {
     display: none !important;
   }
 
-  /* 装饰行不是原生 tr，必须显式保持一行在同一张纸上。
-   * 否则 Chromium 会把同一格的首尾文字分到相邻两页。 */
+  /* 页边距已经由 @page 提供。屏幕的内边距和 min-height 会额外缩窄表格，
+   * 还可能把文末之后的编辑留白推成空白页。 */
+  body.paper #editor .cm-content { width: 100% !important; min-height: 0 !important; padding: 0 !important; }
+  /* 纸面按内容重新分配列宽，不沿用屏幕的百分比。数字也参与换行后的
+   * min-content 计算，长数字不能再独占最小宽度，短编号由格子下限保护。 */
+  .cm-content .cm-md-table-widget { table-layout: auto; }
+  .cm-content .cm-md-table-cell { width: auto !important; }
   .cm-content .cm-md-table-row { break-inside: avoid; }
-
-  /* 纸比窗口窄，打印时脚本不会重排：列宽按屏幕上的占比缩小，数字放不下就拆行，不裁到纸外。
-   * 代价是屏幕上刚好放下的金额在纸上也可能拆成两行，比被裁掉好 */
+  .cm-content .cm-md-table-header { display: table-header-group; break-after: avoid; }
+  .cm-content .cm-md-table-header + .cm-md-table-delimiter + .cm-md-table-row { break-before: avoid; }
   .cm-content .cm-md-table-number { white-space: normal; }
+  .cm-content .cm-md-table-token { white-space: nowrap; }
+
 }
 
 /* ======= mermaid ======= */

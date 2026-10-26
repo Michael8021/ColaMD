@@ -1796,7 +1796,7 @@ window.__colamdExportDocumentHTML = (): string => {
 window.__colamdPrintExport = {
   enter: async () => {
     setCleanExport(true)
-    await enterPaperLayout(true)
+    await enterPaperLayout()
   },
   exit: () => {
     exitPaperLayout()

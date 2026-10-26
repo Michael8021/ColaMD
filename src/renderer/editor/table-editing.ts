@@ -41,7 +41,7 @@ const NUMERIC = /^[+-]?\d[\d,.]*%?$/
 
 const tableCache = new WeakMap<EditorState['doc'], Map<string, MarkdownTable>>()
 
-/** 列宽按占比写：打印时纸比窗口窄、脚本不会重算，按占比才放得下。wrapColumns 是数字也要拆行的列 */
+/** 屏幕列宽按占比写；打印媒体按纸宽重新分配。wrapColumns 是数字也要拆行的列 */
 interface TableLayout { width: number; columns: number[]; wrapColumns: number[] }
 interface TableLayoutSnapshot extends TableLayout {
   length: number
@@ -339,8 +339,11 @@ function decorateRow(state: EditorState, row: TableRow, rowIndex: number, align:
       ranges.push({ from: cell.from, to: cell.to, deco: cell.from < cell.to ? Decoration.replace({ widget }) : Decoration.widget({ widget, side: 1 }) })
       return
     }
-    const numeric = NUMERIC.test(state.sliceDoc(cell.start, cell.end))
-    ranges.push({ from: cell.from, to: cell.to, deco: Decoration.mark({ class: `cm-md-table-cell${numeric ? ' cm-md-table-number' : ''}`, attributes: { 'data-column': String(column), role: rowIndex === 0 ? 'columnheader' : 'cell', style: `text-align:${align[column]}` } }) })
+    const text = state.sliceDoc(cell.start, cell.end)
+    const numeric = NUMERIC.test(text)
+    // 纸面重排时保留短编号/金额的最小词宽；长数字仍允许参与折行。
+    const token = /^[A-Za-z0-9_.,%+-]{1,12}$/.test(text) && /\d/.test(text)
+    ranges.push({ from: cell.from, to: cell.to, deco: Decoration.mark({ class: `cm-md-table-cell${numeric ? ' cm-md-table-number' : ''}${token ? ' cm-md-table-token' : ''}`, attributes: { 'data-column': String(column), role: rowIndex === 0 ? 'columnheader' : 'cell', style: `text-align:${align[column]}` } }) })
     const { left, right } = cell
     if (left > cell.from) ranges.push({ from: cell.from, to: left, deco: Decoration.replace({ widget: new TableBoundary(column) }) })
     if (right < cell.to) ranges.push({ from: right, to: cell.to, deco: Decoration.replace({ widget: new TableBoundary(column, true) }) })
