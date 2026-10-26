@@ -974,13 +974,13 @@ function rowText(state: EditorState, table: MarkdownTable): string {
   return `${prefix}| ${table.align.map(() => '').join(' | ')} |`
 }
 
-function insertRow(view: EditorView, below = true): boolean {
+function insertRow(view: EditorView, below = true, targetColumn?: number): boolean {
   const current = currentCell(view.state)
   if (!current || !view.state.facet(EditorView.editable) || view.state.readOnly) return false
   const { table, row, column } = current
   const after = below ? row : Math.max(0, row - 1)
   const from = after === 0 ? table.delimiter.to : table.rows[after].to
-  editTable(view, table, { from, insert: `\n${rowText(view.state, table)}` }, after + 1, column)
+  editTable(view, table, { from, insert: `\n${rowText(view.state, table)}` }, after + 1, targetColumn ?? column)
   return true
 }
 
@@ -1038,7 +1038,7 @@ function navigate(view: EditorView, direction: number, vertical = false): boolea
   if (index < 0) {
     leaveTable(view, table, -1)
   } else if (index >= table.rows.length * table.align.length) {
-    return insertRow(view)
+    return insertRow(view, true, vertical ? undefined : 0)
   } else {
     selectCell(view, table, Math.floor(index / table.align.length), index % table.align.length)
   }

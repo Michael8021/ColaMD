@@ -571,11 +571,77 @@ try {
   await key('z', MOD)
   await clickCell(3, 2)
   await key('Tab')
+  check('末格 Tab 增行后由新行首格的临时输入接住', await evaluate(`document.activeElement.classList.contains('cm-md-table-input') && document.activeElement.closest('.cm-md-table-row').dataset.tableRow === '4' && document.activeElement.closest('.cm-md-table-cell').dataset.column === '0'`))
+  await key('z', MOD)
+  check('末格 Tab 增行可一步撤销', await doc() === fixture)
+  await clickCell(3, 2)
+  await key('Tab')
   await type('末尾')
-  check('末格按 Tab 新增行并可继续输入', (await doc()).includes('|  |  | 末尾 |'), await doc())
+  check('末格按 Tab 新增行并可继续输入', (await doc()).includes('| 末尾 |  |  |'), await doc())
+  await key('Tab')
+  await type('中格')
+  await key('Tab')
+  await type('末格')
+  check('Tab 依次填满新行各格且不额外增行', (await doc()).includes('| 末尾 | 中格 | 末格 |') && (await doc()).split('\n').length === fixture.split('\n').length + 1, await doc())
+  const filledRow = await doc()
+  await key('Tab')
+  await type('下一行')
+  check('新行末格再次 Tab 才增下一行并落在首格', (await doc()).includes('| 末尾 | 中格 | 末格 |\n| 下一行 |  |  |') && (await doc()).split('\n').length === fixture.split('\n').length + 2, await doc())
   await key('z', MOD)
   await key('z', MOD)
+  check('下一次增行和输入可分别撤销', await doc() === filledRow)
+  for (let i = 0; i < 4; i++) await key('z', MOD)
   check('末尾增行和编辑可撤销', await doc() === fixture)
+  await clickCell(3, 2)
+  await key('Tab')
+  await send('Input.imeSetComposition', { text: 'zhong', selectionStart: 5, selectionEnd: 5 }); await sleep(60)
+  await send('Input.imeSetComposition', { text: '中文', selectionStart: 2, selectionEnd: 2 }); await sleep(60)
+  await type('中文'); await sleep(100)
+  check('Tab 新增行首格支持中文组合输入', (await doc()).includes('| 中文 |  |  |') && !(await doc()).includes('zhong'), await doc())
+  await key('z', MOD)
+  check('新行首格中文输入可一步撤销', (await doc()).includes('|  |  |  |') && !(await doc()).includes('中文'), await doc())
+  await key('z', MOD)
+  check('中文输入撤销后增行仍可一步撤销', await doc() === fixture)
+  await select('缺省')
+  await key('Tab')
+  await key('Enter')
+  await type('同列')
+  check('末行 Enter 增行后仍保持当前列', (await doc()).includes('|  | 同列 |  |'), await doc())
+  await key('z', MOD)
+  await key('z', MOD)
+  check('Enter 增行和输入可分别撤销', await doc() === fixture)
+
+  for (const [name, prefix, source] of [
+    ['引用', '> ', '> | A | B | C |\n> |---|---|---|\n> | x | y | z |\n'],
+    ['无序列表', '  ', '- | A | B | C |\n  |---|---|---|\n  | x | y | z |\n'],
+    ['有序列表', '   ', '1. | A | B | C |\n   |---|---|---|\n   | x | y | z |\n'],
+    ['引用内列表', '>   ', '> - | A | B | C |\n>   |---|---|---|\n>   | x | y | z |\n'],
+  ]) {
+    await setDoc(source)
+    await clickCell(1, 2)
+    await key('Tab')
+    await type('首格')
+    await key('Tab')
+    await type('中格')
+    await key('Tab')
+    await type('末格')
+    check(`${name}表格末格 Tab 后依次填完新行且保留前缀`, await doc() === source.trimEnd() + `\n${prefix}| 首格 | 中格 | 末格 |\n`, await doc())
+    for (let i = 0; i < 3; i++) await key('z', MOD)
+    check(`${name}表格输入撤销后只留下新增空行`, await doc() === source.trimEnd() + `\n${prefix}|  |  |  |\n`, await doc())
+    await key('z', MOD)
+    check(`${name}表格 Tab 增行可一步撤销`, await doc() === source)
+    for (const [action, modifiers, above] of [['Enter', 0, false], ['⌘Enter', MOD, false], ['⌘⇧Enter', MOD | 8, true]]) {
+      await select('y')
+      await key('Enter', modifiers)
+      await type('同列')
+      const row = `${prefix}|  | 同列 |  |\n`
+      const expected = above ? source.replace(`${prefix}| x | y | z |\n`, row + `${prefix}| x | y | z |\n`) : source.trimEnd() + '\n' + row
+      check(`${name}表格 ${action} 插行保持当前列与前缀`, await doc() === expected, await doc())
+      await key('z', MOD)
+      await key('z', MOD)
+      check(`${name}表格 ${action} 插行和输入可分别撤销`, await doc() === source)
+    }
+  }
 
   const emptyCases = '| 姓名 | 城市 | 邮箱 | 备注 |\n|---|---|---|---|\n|  | 香港 |  | 等待 |\n||上海|||\n| 缺省 |\n'
   for (const theme of themes) {
