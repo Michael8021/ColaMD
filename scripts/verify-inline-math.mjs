@@ -175,14 +175,6 @@ try {
       check(label+' 删除撤销恢复原文',(await snapshot()).doc===text,await snapshot())
     }
     await setDoc(text)
-    for(const ratio of [0.1,0.5,0.9]) {
-      await select(formula,0)
-      const point=await evaluate(`(()=>{const r=v.contentDOM.querySelector('.cm-md-math-inline').getBoundingClientRect();return {x:r.left+r.width*${ratio},y:(r.top+r.bottom)/2}})()`)
-      await clickPoint(point)
-      const expected=from+1+Math.round(ratio*(formula.length-2))
-      await inspect(label+' 鼠标比例'+ratio,expected,true)
-      await screenshot(label+'-08-click-'+ratio)
-    }
     await select(formula,-1)
     const shiftPoint=await evaluate(`(()=>{const r=v.contentDOM.querySelector('.cm-md-math-inline').getBoundingClientRect();return {x:r.left+r.width*0.95,y:(r.top+r.bottom)/2}})()`)
     await clickPoint(shiftPoint,8)
@@ -241,6 +233,110 @@ try {
     await screenshot(label+'-11-print')
     await evaluate('window.__colamdPrintExport.exit()')
     await inspect(label+' 导出结束恢复内部编辑',from+3,true)
+  }
+  // 以可见字形的独立 Range 定点击坐标，不调用产品映射 helper。
+  // 重复字形用屏幕上下/左右位置选目标；预期源码位置由夹具明确指定。
+  const glyphCases = [
+    { name:'普通字母', code:'abc+123', glyph:'b', source:1 },
+    { name:'普通数字', code:'abc+123', glyph:'2', source:5 },
+    { name:'重复平方左', code:'x^2+y^2', glyph:'2', occurrence:0, source:2 },
+    { name:'重复平方右', code:'x^2+y^2', glyph:'2', occurrence:1, source:6 },
+    // 相同横坐标的同字仍以比例为参考，两处都选第一个 a，不承诺语义级分子/分母映射。
+    { name:'重复分子', code:'\\frac{a}{a}', glyph:'a', occurrence:0, source:6 },
+    { name:'重复分母', code:'\\frac{a}{a}', glyph:'a', occurrence:1, source:6 },
+    { name:'重复上标', code:'a_i^a', glyph:'a', occurrence:0, source:4 },
+    { name:'重复基底', code:'a_i^a', glyph:'a', occurrence:1, source:0 },
+    { name:'下标', code:'a_i^a', glyph:'i', source:2 },
+    { name:'排除命令字母', code:'\\frac{r}{f}', glyph:'f', source:9 },
+    { name:'命令符号回退', code:'\\alpha+x', glyph:'α', fallback:true },
+    { name:'减号对照', code:'a-b', glyph:'−', source:1 },
+    { name:'星号对照', code:'a*b', glyph:'∗', source:1 },
+    { name:'撇号对照', code:"x'", glyph:'′', source:1 },
+    { name:'color参数', code:'\\color{red}{e}', glyph:'e', source:12 },
+    { name:'textcolor参数', code:'\\textcolor{red}{r}', glyph:'r', source:16 },
+    { name:'colorbox参数', code:'\\colorbox{red}{r}', glyph:'r', source:15 },
+    { name:'fcolorbox参数', code:'\\fcolorbox{red}{green}{r}', glyph:'r', source:23 },
+    { name:'环境名左上', code:'\\begin{matrix}m&a\\\\t&r\\end{matrix}', glyph:'m', source:14 },
+    { name:'环境名右下', code:'\\begin{matrix}m&a\\\\t&r\\end{matrix}', glyph:'r', source:21 },
+    { name:'array列格式', code:'\\begin{array}{r}r\\end{array}', glyph:'r', source:16 },
+    { name:'星号矩阵对齐', code:'\\begin{matrix*}[r]r\\end{matrix*}', glyph:'r', source:18 },
+    { name:'无括号尺寸', code:'\\kern1em m', glyph:'m', source:9 },
+    { name:'有括号尺寸', code:'\\hspace*{1em}m', glyph:'m', source:13 },
+    { name:'星号前空白', code:'\\hspace *{1em}m', glyph:'m', source:14 },
+    { name:'矩阵行间距', code:'\\begin{matrix}a\\\\[1em]m\\end{matrix}', glyph:'m', source:22 },
+    { name:'保留行间距样式正文', code:'\\begin{matrix}a\\\\ [1em]m\\end{matrix}', glyph:'e', source:20 },
+    { name:'rule尺寸', code:'\\rule[1em]{2em}{1em}+m', glyph:'m', source:21 },
+    { name:'raisebox尺寸', code:'\\raisebox{1em}{m}', glyph:'m', source:15 },
+    { name:'genfrac样式', code:'\\genfrac{}{}{1pt}{2}{2}{t}', glyph:'2', source:21 },
+    { name:'smash选项', code:'\\smash[t]{t}', glyph:'t', source:10 },
+    { name:'不可见正文', code:'\\phantom{a}+a', glyph:'a', source:12 },
+    { name:'保留text正文', code:'\\text{red}', glyph:'r', source:6 },
+    { name:'保留转义字面符号', code:'x+\\%', glyph:'%', source:3 },
+    { name:'隐藏定界符', code:'\\left.x\\right.+.', glyph:'.', source:15 },
+    { name:'禁止信任的参数', code:'\\href{red}{r}', glyph:'r', fallback:true },
+    { name:'不可见字形回退', code:'\\phantom{a}+x', selector:'span[style*="transparent"]', fallback:true },
+    { name:'按样式择支回退', code:'\\mathchoice{a}{b}{c}{d}', glyph:'b', fallback:true },
+    { name:'代理对字形', code:'😀+x', glyph:'😀', source:0 },
+    { name:'分数线回退', code:'\\frac{x}{y}', selector:'.frac-line', fallback:true },
+    { name:'根号线回退', code:'\\sqrt{x}', selector:'.sqrt .hide-tail', fallback:true },
+    { name:'空白回退', code:'a\\quad b', selector:'.mspace', fallback:true },
+    { name:'代理对回退', code:'\\alpha+😀', glyph:'α', fallback:true },
+    { name:'旧caretAPI', code:'abc+123', glyph:'b', source:1, legacy:true },
+  ]
+  // 检查固定偏移确实指向预期字符，避免转义写错后得到假的点击验收。
+  for(const test of glyphCases.filter(test=>!test.fallback)) {
+    const expected = { '−':'-', '∗':'*', '′':"'" }[test.glyph] ?? test.glyph
+    assert.equal(String.fromCodePoint(test.code.codePointAt(test.source)),expected,`${test.name} 夹具源码偏移`)
+  }
+  const clickMeasurements=[]
+  for(const [label,original] of cases) for(const test of glyphCases) {
+    const raw='$'+test.code+'$', text=original.replace(formula,raw), from=text.indexOf(raw)
+    await setDoc(text)
+    for(const half of [0.25,0.75]) {
+      await select(raw,0)
+      const point=await evaluate(`(()=>{
+        const widget=v.contentDOM.querySelector('.cm-md-math-inline'),whole=widget.getBoundingClientRect();
+        let rect;
+        if(${JSON.stringify(test.selector??null)}) {
+          const element=widget.querySelector(${JSON.stringify(test.selector??null)});
+          rect=element?.getBoundingClientRect();
+          if(element?.matches('.mspace'))rect={left:rect.left,width:parseFloat(getComputedStyle(element).marginRight),top:whole.top,bottom:whole.bottom};
+        }
+        else {
+          const found=[],walker=document.createTreeWalker(widget.querySelector('.katex-html'),NodeFilter.SHOW_TEXT);
+          for(let node;node=walker.nextNode();) {
+            if(getComputedStyle(node.parentElement).color==='rgba(0, 0, 0, 0)')continue;
+            let offset=0;for(const char of node.textContent){
+              if(char===${JSON.stringify(test.glyph)}){const range=document.createRange();range.setStart(node,offset);range.setEnd(node,offset+char.length);const b=range.getBoundingClientRect();if(b.width&&b.height)found.push({left:b.left,right:b.right,top:b.top,bottom:b.bottom,width:b.width,height:b.height})}
+              offset+=char.length;
+            }
+          }
+          found.sort((a,b)=>Math.abs(a.top-b.top)>1?a.top-b.top:a.left-b.left);
+          rect=found[${test.occurrence??0}];
+        }
+        if(!rect)return {error:'没有找到字形',html:widget.outerHTML};
+        // CDP 的命中和 MouseEvent 都取整数坐标；1px 分数线须选确实在盒内的整数行。
+        const x=Math.round(rect.left+rect.width*${half}),height=rect.bottom-rect.top;
+        const y=height<=1.5?Math.ceil(rect.top):Math.round((rect.top+rect.bottom)/2);
+        return {x,y,ratio:(x-whole.left)/whole.width,lineHit:document.elementsFromPoint(x,y).some(e=>e.matches('.frac-line'))};
+      })()`)
+      assert(!point.error,`${test.name}: ${JSON.stringify(point)}`)
+      if(test.selector==='.frac-line')assert(point.lineHit,`${label} ${test.name} 必须实际点到分数线`)
+      if(half===0.25)await screenshot(label+'-glyph-'+test.name+'-rendered')
+      if(test.legacy)await evaluate(`Object.defineProperty(document,'caretPositionFromPoint',{value:undefined,configurable:true})`)
+      // capture 阶段到 bubble 阶段包含整个公式 mousedown 处理与选区事务；不计 CDP/测试等待。
+      await evaluate(`window.__mathClickStart=0;window.__mathClickDuration=null;window.__mathCapture=()=>{window.__mathClickStart=performance.now()};window.__mathBubble=()=>{window.__mathClickDuration=performance.now()-window.__mathClickStart};document.addEventListener('mousedown',window.__mathCapture,true);document.addEventListener('mousedown',window.__mathBubble)`)
+      try { await clickPoint({x:point.x,y:point.y}) }
+      finally {
+        if(test.legacy)await evaluate(`delete document.caretPositionFromPoint`)
+        const duration=await evaluate(`(()=>{document.removeEventListener('mousedown',window.__mathCapture,true);document.removeEventListener('mousedown',window.__mathBubble);return window.__mathClickDuration})()`)
+        clickMeasurements.push({context:label,name:test.name,half,duration})
+      }
+      let offset=test.fallback?Math.round(point.ratio*test.code.length):test.source+(half>0.5?String.fromCodePoint(test.code.codePointAt(test.source)).length:0)
+      if(offset>0 && /[\uDC00-\uDFFF]/.test(test.code[offset]??''))offset--
+      await inspect(label+' 字形'+test.name+' '+(half<0.5?'左半':'右半'),from+1+offset,true)
+      await screenshot(label+'-glyph-'+test.name+'-'+(half<0.5?'left':'right'))
+    }
   }
   // 上下移动落到公式横向范围，必须按原子区间落在两侧。
   for(const keyName of ['ArrowDown','ArrowUp']) {
@@ -322,7 +418,7 @@ try {
     await screenshot(theme+'-restored')
   }
   check('运行时无异常',!runtimeErrors.length,runtimeErrors)
-  const result={passed,failures,runtimeErrors,tableEditing}
+  const result={passed,failures,runtimeErrors,tableEditing,clickMeasurements}
   if(output)writeFileSync(join(output,'results.json'),JSON.stringify(result,null,2))
   console.log(JSON.stringify(result,null,2))
   assert.equal(failures.length,0,`${failures.length} 项公式检查失败`)

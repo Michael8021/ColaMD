@@ -27,6 +27,7 @@ import { forceParsing, syntaxTree } from '@codemirror/language'
 import type { SyntaxNode, SyntaxNodeRef } from '@lezer/common'
 import katex from 'katex'
 import { scanMath, excludedRanges, frontmatterRange, type Excluded } from './math-scan'
+import { inlineMathClickOffset } from './inline-math-click'
 import { renderMermaid, attachDiagramZoom, detachDiagramZoom, isDiagramZoomed } from './mermaid-bridge'
 import { sanitizeHTML, cleanStyle } from './html-sanitize'
 import { footnoteDefinitions, footnoteNumbers, FOOTNOTE_REF_RE } from './footnotes'
@@ -498,6 +499,12 @@ const inlineMathNavigation = [
       const delim = view.state.sliceDoc(from, from + 2) === '$$' || view.state.sliceDoc(from, from + 1) === '\\' ? 2 : 1
       const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width))
       let anchor = from + delim + Math.round(ratio * (to - from - 2 * delim))
+      if (!event.shiftKey) {
+        const contentFrom = from + delim
+        const offset = inlineMathClickOffset(widget, event.target as Element, view.state.sliceDoc(contentFrom, to - delim),
+          event.clientX, event.clientY, anchor - contentFrom)
+        if (offset !== undefined) anchor = contentFrom + offset
+      }
       // 不把 UTF-16 代理对劈开。
       if (anchor > from + delim && /[\uDC00-\uDFFF]/.test(view.state.sliceDoc(anchor, anchor + 1))) anchor--
       event.preventDefault()
