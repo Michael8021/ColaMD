@@ -444,7 +444,19 @@ function isInlineMathActive(state: EditorState, from: number, to: number): boole
 function collectMath(state: EditorState, ranges: DecorationRange[]): void {
   const text = state.doc.toString()
   const excluded: Excluded[] = excludedRanges(text, syntaxTree(state))
-  for (const range of scanMath(text, excluded)) {
+  const math = scanMath(text, excluded)
+  if (!math.length) return
+  // 外层格式可以恰好只包住公式。它不是公式内部的 Markdown 装饰；边界要包住
+  // 整个替换 widget，也要排在同范围的源码 mark 外面，复制时才能自然继承样式。
+  const inlineEnds = new Map(math.filter(range => !range.block).map(range => [range.from, range.to]))
+  const enclosingMarks = new Set<DecorationRange>()
+  for (const item of ranges) {
+    if (!item.deco.point && inlineEnds.get(item.from) === item.to) {
+      item.deco = MARK({ ...item.deco.spec, inclusive: true })
+      enclosingMarks.add(item)
+    }
+  }
+  for (const range of math) {
     const delim = text.startsWith('$$', range.from) || text[range.from] === '\\' ? 2 : 1
     const inlineMath = range.block ? undefined : { delim }
     if (!exportingCleanly(state) && (range.block ? isBlockActive(state, range.from, range.to)
@@ -453,7 +465,7 @@ function collectMath(state: EditorState, ranges: DecorationRange[]): void {
       if (!range.block) for (let i = ranges.length - 1; i >= 0; i--) {
         const item = ranges[i]
         if (item.from >= range.from && item.to <= range.to && item.from !== item.to &&
-            !item.deco.spec.class?.includes('cm-md-table-')) ranges.splice(i, 1)
+            !enclosingMarks.has(item) && !item.deco.spec.class?.includes('cm-md-table-')) ranges.splice(i, 1)
       }
       if (!range.block) ranges.push({ from: range.from, to: range.to, deco: MARK({ class: 'cm-md-math-source', inclusive: true, inlineMath }) })
       ranges.push({ from: range.from, to: range.from + delim, deco: MARK({ class: 'cm-md-marker' }) })
@@ -462,6 +474,14 @@ function collectMath(state: EditorState, ranges: DecorationRange[]): void {
       ranges.push({ from: range.from, to: range.to,
         deco: Decoration.replace({ widget: new MathWidget(range.code, range.block, range.from, range.to), inlineMath }) })
     }
+  }
+  if (enclosingMarks.size) {
+    // CM 把同范围、同 startSide 的后一个 mark 放外层。源码 wrapper 必须在格式
+    // 里面，否则清洁复制读取源码 textContent 时会越过被包在里面的颜色/链接。
+    let kept = 0
+    for (const item of ranges) if (!enclosingMarks.has(item)) ranges[kept++] = item
+    ranges.length = kept
+    for (const item of enclosingMarks) ranges.push(item)
   }
 }
 

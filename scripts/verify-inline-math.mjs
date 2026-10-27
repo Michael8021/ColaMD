@@ -406,6 +406,19 @@ try {
   await setDoc('abc $a**b**$ def\n')
   await select('$a**b**$',2)
   check('公式内部Markdown字符全部可编辑',await evaluate(`v.contentDOM.querySelector('.cm-md-math-source').textContent==='$a**b**$'`),await snapshot())
+  // 格式范围恰好等于公式范围时，也必须包住源码和替换 widget；不能当作公式内部标记删掉。
+  for (const [label, value, glyph] of [['inherit', formula, 'E'], ['explicit', '$\\textcolor{red}{x}+y$', 'y']]) {
+    const text = '<span style="color:#12ab34">' + value + '</span>\n'
+    await setDoc(text)
+    await select(value, 2)
+    check(label+' 等范围外层颜色保留在编辑源码',await evaluate(`getComputedStyle(v.contentDOM.querySelector('.cm-md-math-source')).color==='rgb(18, 171, 52)'`),await snapshot())
+    await screenshot(label+'-exact-color-source')
+    await select(value, 0)
+    const colors = await evaluate(`Array.from(v.contentDOM.querySelectorAll('.katex-html .mord')).filter(node=>!node.children.length).map(node=>({text:node.textContent,color:getComputedStyle(node).color}))`)
+    check(label+' 等范围外层颜色保留在渲染公式',colors.some(item=>item.text===glyph&&item.color==='rgb(18, 171, 52)'),colors)
+    if(label==='explicit') check('等范围外层颜色不覆盖公式显式颜色',colors.some(item=>item.text==='x'&&item.color==='rgb(255, 0, 0)'),colors)
+    await screenshot(label+'-exact-color-rendered')
+  }
   for(const theme of ['light','dark']) {
     await evaluate(`for(const name of [...document.body.classList])if(name.startsWith('theme-'))document.body.classList.remove(name);document.body.classList.add('theme-${theme}')`)
     await setDoc('abc '+formula+' def\n');await select(formula,0)
