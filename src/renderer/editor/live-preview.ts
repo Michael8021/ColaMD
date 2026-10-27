@@ -489,7 +489,7 @@ const inlineMathNavigation = [
   ])),
   Prec.highest(EditorView.domEventHandlers({
     mousedown(event, view) {
-      if (event.button !== 0 || event.shiftKey || event.metaKey || event.ctrlKey || event.altKey || view.composing) return false
+      if (event.button !== 0 || event.metaKey || event.ctrlKey || event.altKey || view.composing) return false
       const widget = (event.target as HTMLElement).closest<HTMLElement>('.cm-md-math-inline')
       if (!widget || exportingCleanly(view.state)) return false
       const from = Number(widget.dataset.sourceFrom), to = Number(widget.dataset.sourceTo)
@@ -501,7 +501,10 @@ const inlineMathNavigation = [
       // 不把 UTF-16 代理对劈开。
       if (anchor > from + delim && /[\uDC00-\uDFFF]/.test(view.state.sliceDoc(anchor, anchor + 1))) anchor--
       event.preventDefault()
-      view.dispatch({ selection: EditorSelection.create([EditorSelection.cursor(anchor)]), userEvent: 'select.pointer' })
+      const selection = event.shiftKey
+        ? EditorSelection.single(view.state.selection.main.anchor, ratio < 0.5 ? from : to)
+        : EditorSelection.create([EditorSelection.cursor(anchor)])
+      view.dispatch({ selection, userEvent: 'select.pointer' })
       view.contentDOM.focus({ preventScroll: true })
       return true
     },
