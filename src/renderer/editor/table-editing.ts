@@ -742,7 +742,11 @@ const tableLayout = ViewPlugin.fromClass(class {
         queueMicrotask(() => {
           if (!this.style.isConnected) return
           const theme = tableGeometry.get(this.view.state) === tableGeometryTheme ? [] : tableGeometryTheme
-          this.view.dispatch({ effects: tableGeometry.reconfigure(theme), annotations: tableGeometryUpdate.of(true) })
+          const range = this.view.state.selection.main
+          const caret = currentCell(this.view.state) && this.view.coordsAtPos(range.head, range.assoc || 1)
+          const viewport = this.view.scrollDOM.getBoundingClientRect()
+          const selection = caret && caret.bottom >= viewport.top && caret.top <= viewport.bottom ? this.view.state.selection : undefined
+          this.view.dispatch({ selection, effects: tableGeometry.reconfigure(theme), annotations: [tableGeometryUpdate.of(true), Transaction.addToHistory.of(false)], filter: false })
         })
       }
       for (const probe of plan.pending) {
@@ -782,14 +786,19 @@ const tableEdit = Annotation.define<boolean>()
 // 整行移动、复制和缩进修改的是结构，不能当作单元格文字重写。
 const cellEditEvents = ['input.type', 'input.paste', 'input.drop', 'delete', 'move.drop']
 const isCellEdit = (tr: Transaction) => cellEditEvents.some(event => tr.isUserEvent(event))
-const setVirtualCell = StateEffect.define<{ row: number; column: number }>()
+const setVirtualCell = StateEffect.define<{ row: number; column: number } | null>({
+  map: (value, changes) => value && ({ ...value, row: changes.mapPos(value.row, -1) }),
+})
 const virtualCell = StateField.define<{ row: number; column: number } | null>({
   create: () => null,
   update(value, tr) {
     const effect = tr.effects.find(effect => effect.is(setVirtualCell))
-    return effect ? effect.value : tr.docChanged || tr.selection ? null : value
+    return effect ? effect.value : tr.docChanged || tr.selection && !tr.annotation(tableGeometryUpdate) ? null : value
   },
 })
+
+const tableCellHistory = invertedEffects.of(tr => tr.docChanged && (tr.startState.field(virtualCell) || tr.effects.some(effect => effect.is(setVirtualCell)))
+  ? [setVirtualCell.of(tr.startState.field(virtualCell))] : [])
 
 const setTableParagraph = StateEffect.define<TableParagraph | null>({
   map: (paragraph, changes) => paragraph && ({
@@ -806,7 +815,7 @@ const tableParagraph = StateField.define<{ paragraph: TableParagraph | null; dec
   create: () => ({ paragraph: null, decorations: Decoration.none }),
   update(value, tr) {
     const effect = tr.effects.find(effect => effect.is(setTableParagraph))
-    const paragraph = effect ? effect.value : tr.docChanged || tr.selection ? null : value.paragraph
+    const paragraph = effect ? effect.value : tr.docChanged || tr.selection && !tr.annotation(tableGeometryUpdate) ? null : value.paragraph
     if (paragraph === value.paragraph && !tr.reconfigured) return value
     return {
       paragraph,
@@ -867,7 +876,7 @@ const emptyCellFocus = ViewPlugin.fromClass(class {
       const input = view.contentDOM.querySelector<HTMLElement>(`${tableDOMSelector(view.state, current.table.from)} [data-table-row="${current.row}"] [data-column="${current.column}"] .cm-md-table-input`)
       if (!input) return
       this.pending = false
-      if (input.isContentEditable) input.focus()
+      if (input.isContentEditable) input.focus({ preventScroll: true })
     })
   }
 }, {
@@ -948,33 +957,54 @@ function currentCell(state: EditorState) {
 
 // 光标贴住所在的格：紧凑表格 `|xy|zw|` 的格尾就是右侧竖线的位置，空格子的位置也常与下一格
 // 左边的竖线重合。不贴住，光标会画到竖线之后，接着输入的字落进下一格。
-function cellAssoc(cell: TableCell | undefined, head: number): -1 | 0 | 1 {
+function cellAssoc(cell: TableCell | undefined, head: number, state?: EditorState): -1 | 0 | 1 {
   if (!cell) return 0
   if (cell.start === cell.end) return head === cell.to ? -1 : 0
+  if (state) {
+    for (const side of [1, -1] as const) {
+      const marker = syntaxTree(state).resolveInner(head, side)
+      if (['CodeMark', 'EmphasisMark', 'StrikethroughMark'].includes(marker.name) &&
+        (side > 0 ? marker.from === head && head > cell.start : marker.to === head && head < cell.end)) return side > 0 ? -1 : 1
+    }
+  }
   return head === cell.end ? -1 : head === cell.start ? 1 : 0
 }
 
-function selectCell(view: EditorView, table: MarkdownTable, row: number, column: number, select = true, goalColumn?: number): void {
+function cellSelection(state: EditorState, table: MarkdownTable, row: number, column: number, offset: number | 'end' = 0, select = false, goalColumn?: number): TransactionSpec {
   const target = table.rows[row]
   const cell = target.cells[column]
-  const from = cell?.start ?? target.to
-  const to = select ? (cell?.end ?? target.to) : from
-  view.dispatch({
-    selection: from === to ? EditorSelection.create([EditorSelection.cursor(from, cellAssoc(cell, from), undefined, goalColumn)]) : EditorSelection.single(from, to),
+  const from = cell ? offset === 'end' ? cell.end : Math.max(cell.left, Math.min(cell.right, cell.start + offset)) : target.to
+  const to = select ? cell?.end ?? target.to : from
+  return {
+    selection: from === to ? EditorSelection.create([EditorSelection.cursor(from, cellAssoc(cell, from, state), undefined, goalColumn)]) : EditorSelection.single(from, to),
     effects: setVirtualCell.of({ row: target.from, column }),
-    scrollIntoView: true,
-  })
+  }
+}
+
+function selectCell(view: EditorView, table: MarkdownTable, row: number, column: number, select = true, goalColumn?: number, scrollIntoView = true): void {
+  view.dispatch({ ...cellSelection(view.state, table, row, column, 0, select, goalColumn), userEvent: 'select', scrollIntoView })
+  const cell = table.rows[row].cells[column]
   // 空格子的输入框由 emptyCellFocus 接手，屏外的行等绘制出来再交
   if (!cell || cell.start === cell.end) view.focus()
 }
 
-function editTable(view: EditorView, table: MarkdownTable, changes: ChangeSpec, row: number, column: number): void {
-  const next = view.state.update({ changes })
-  const updated = tableAt(next.state, next.changes.mapPos(table.from))
+function dispatchCellEdit(view: EditorView, transaction: Transaction): void {
+  view.dispatch([transaction, transaction.state.update({
+    selection: transaction.state.selection,
+    effects: setVirtualCell.of(transaction.state.field(virtualCell)),
+    userEvent: 'select',
+    filter: false,
+  })])
+}
+
+function editTable(view: EditorView, table: MarkdownTable, changes: ChangeSpec, row: number, column: number, anchor?: number, userEvent = 'input'): void {
+  const next = view.state.update({ changes, filter: false })
+  const updated = tableAt(next.state, next.changes.mapPos(table.from, -1))
   const target = updated?.rows[row]
-  const anchor = target?.cells[column]?.end ?? next.changes.mapPos(view.state.selection.main.head)
-  view.dispatch({ changes, selection: EditorSelection.create([EditorSelection.cursor(anchor, -1)]), annotations: tableEdit.of(true), userEvent: 'input', scrollIntoView: true })
-  if (updated && target && (!target.cells[column] || target.cells[column].start === target.cells[column].end)) selectCell(view, updated, row, column, false)
+  const selection = updated && target ? cellSelection(next.state, updated, row, column, anchor === undefined ? 'end' : anchor - (target.cells[column]?.start ?? target.to))
+    : { selection: EditorSelection.create([EditorSelection.cursor(next.changes.mapPos(view.state.selection.main.head), -1)]) }
+  const transaction = view.state.update({ changes, ...selection, annotations: [tableEdit.of(true), ...(userEvent === 'input.paste' ? [isolateHistory.of('full')] : [])], userEvent, scrollIntoView: true })
+  dispatchCellEdit(view, transaction)
 }
 
 function rowText(state: EditorState, table: MarkdownTable): string {
@@ -1120,25 +1150,30 @@ type CellTextEdit = { from: number; to: number; text: string }
 function cellChanges(state: EditorState, cell: TableCell, edits: CellTextEdit[]) {
   const context = cellEditContext(state, cell)
   const changes = edits.map(edit => prepareCellChange(cell, context, edit.from, edit.to, edit.text))
-  let candidate = '', copied = cell.left
+  let candidate = '', copied = cell.left, cursor = cell.left
   for (const change of changes) {
     if (change.from < copied) return null
     candidate += state.sliceDoc(copied, change.from) + change.insert
+    cursor = cell.left + candidate.length
     copied = change.to
   }
   candidate += state.sliceDoc(copied, cell.right)
   // 按整格复核，兼顾刚插入/删除反引号导致代码跨度变化的情况，再收回最小源码改动。
   const original = state.sliceDoc(cell.left, cell.right)
   let safe = cellText(candidate)
-  if (state.sliceDoc(cell.right, cell.right + 1) === '|' && loneSlash(safe)) safe += '\\'
+  cursor += tablePipes(candidate).filter(pipe => cell.left + pipe < cursor).length
+  if (state.sliceDoc(cell.right, cell.right + 1) === '|' && loneSlash(safe)) {
+    if (cursor === cell.left + safe.length) cursor++
+    safe += '\\'
+  }
   if (safe !== candidate || changes.length > 1) {
-    if (safe === original) return safe === candidate ? { from: cell.left, to: cell.left, insert: '' } : null
+    if (safe === original) return safe === candidate ? { from: cell.left, to: cell.left, insert: '', cursor } : null
     let start = 0, end = original.length, nextEnd = safe.length
     while (start < end && start < nextEnd && original[start] === safe[start]) start++
     while (end > start && nextEnd > start && original[end - 1] === safe[nextEnd - 1]) { end--; nextEnd-- }
-    return { from: cell.left + start, to: cell.left + end, insert: safe.slice(start, nextEnd) }
+    return { from: cell.left + start, to: cell.left + end, insert: safe.slice(start, nextEnd), cursor }
   }
-  return changes[0]
+  return { ...changes[0], cursor }
 }
 
 function cellChange(state: EditorState, cell: TableCell, from: number, to: number, text: string) {
@@ -1175,7 +1210,7 @@ function rowSuffix(values: string[], trailing: boolean): { text: string; pipes: 
  * 改反引号可能让代码跨过原来的格线。先按各格编辑，再在受影响的行里复核格线位置。
  * 只有分格会变时，才把该行各格中原本没配对的反引号转义；完整代码与未编辑行不动。
  */
-function preserveTableRows(state: EditorState, changes: TextChange[], rows: Set<number>, insertedPipes = new Map<TextChange, number[]>()): TextChange[] {
+function preserveTableRows(state: EditorState, changes: TextChange[], rows: Set<number>, insertedPipes = new Map<TextChange, number[]>(), caret?: { position: number }): TextChange[] {
   const replaced = new Set<TextChange>()
   const repairs: TextChange[] = []
   const grouped = new Map<number, TextChange[]>()
@@ -1206,7 +1241,9 @@ function preserveTableRows(state: EditorState, changes: TextChange[], rows: Set<
     if (!positions.length) continue
     const escapes = positions.map(pos => ({ from: nextFrom + pos, to: nextFrom + pos, insert: '\\' }))
     // 组合源码改动而不把整行变成一次替换，光标与多选区仍能精确映射。
-    const repaired = set.compose(ChangeSet.of(escapes, set.newLength))
+    const mapping = ChangeSet.of(escapes, set.newLength)
+    if (caret) caret.position = mapping.mapPos(caret.position, 1)
+    const repaired = set.compose(mapping)
     for (const edit of edits) replaced.add(edit)
     repaired.iterChanges((from, to, _fromB, _toB, inserted) => repairs.push({ from, to, insert: inserted.toString() }))
   }
@@ -1328,7 +1365,7 @@ function cellAround(state: EditorState, from: number, to: number): TableCell | u
   return readRow(state, node).cells.slice(0, columns).find(cell => withinCell(cell, from, to))
 }
 
-function insertCellText(view: EditorView, from: number, to: number, text: string): boolean {
+function insertCellText(view: EditorView, from: number, to: number, text: string, userEvent = 'input.type'): boolean {
   const current = currentCell(view.state)
   if (!current || !view.state.facet(EditorView.editable) || view.state.readOnly) return false
   const { cell } = current
@@ -1338,17 +1375,18 @@ function insertCellText(view: EditorView, from: number, to: number, text: string
       // 只有空格的格子：写成 `| 内容 |`，不把字贴在右边的竖线上
       const value = cellText(text)
       const insert = ` ${value}${view.state.sliceDoc(cell.right, cell.right + 1) === '|' ? ' ' : ''}`
-      const changes = preserveTableRows(view.state, [{ from: cell.left, to: cell.right, insert }], new Set([view.state.doc.lineAt(cell.left).from]))
-      const anchor = view.state.changes(changes).mapPos(cell.right, 1) - (insert.endsWith(' ') ? 1 : 0)
-      view.dispatch({ changes, selection: EditorSelection.create([EditorSelection.cursor(anchor, -1)]), annotations: tableEdit.of(true), userEvent: 'input.type' })
+      const change = { from: cell.left, to: cell.right, insert }
+      const caret = { position: view.state.changes(change).mapPos(cell.right, 1) - (insert.endsWith(' ') ? 1 : 0) }
+      const changes = preserveTableRows(view.state, [change], new Set([view.state.doc.lineAt(cell.left).from]), undefined, caret)
+      editTable(view, current.table, changes, current.row, current.column, caret.position, userEvent)
       return true
     }
     const change = cellChange(view.state, cell, from, to, text)
     if (!change) return true
-    if (unchanged(change, from, to, text) && cell.start !== cell.end) return false
-    const changes = preserveTableRows(view.state, [change], new Set([view.state.doc.lineAt(cell.left).from]))
-    const anchor = view.state.changes(changes).mapPos(to, 1)
-    view.dispatch({ changes, selection: EditorSelection.create([EditorSelection.cursor(anchor, -1)]), annotations: tableEdit.of(true), userEvent: 'input.type' })
+    if (unchanged(change, from, to, text) && cell.start !== cell.end && userEvent !== 'input.paste') return false
+    const caret = { position: change.cursor }
+    const changes = preserveTableRows(view.state, [change], new Set([view.state.doc.lineAt(cell.left).from]), undefined, caret)
+    editTable(view, current.table, changes, current.row, current.column, caret.position, userEvent)
   } else {
     const { table, row, column } = current
     const target = table.rows[row]
@@ -1356,7 +1394,7 @@ function insertCellText(view: EditorView, from: number, to: number, text: string
     const suffix = rowSuffix(values, target.trailing)
     const change = { from: target.to, to: target.to, insert: suffix.text }
     const changes = preserveTableRows(view.state, [change], new Set([view.state.doc.lineAt(target.from).from]), new Map([[change, suffix.pipes]]))
-    editTable(view, table, changes, row, column)
+    editTable(view, table, changes, row, column, undefined, userEvent)
   }
   return true
 }
@@ -1495,7 +1533,7 @@ function moveVertical(view: EditorView, direction: 1 | -1, extend = false): bool
   const range = view.state.selection.main
   const caret = view.coordsAtPos(range.head, range.assoc || 1)
   const goal = range.goalColumn ?? (caret ? caret.left - view.contentDOM.getBoundingClientRect().left : undefined)
-  const edge = cell && view.coordsAtPos(direction < 0 ? cell.start : cell.end, direction)
+  const edge = cell && view.coordsAtPos(direction < 0 ? cell.start : cell.end, direction < 0 ? 1 : -1)
   const element = (r: number) => view.contentDOM.querySelector<HTMLElement>(`${tableDOMSelector(view.state, table.from)} [data-table-row="${r}"] [data-column="${column}"]`)
   const own = element(row)
   const lineHeight = own ? Number.parseFloat(getComputedStyle(own).lineHeight) : 0
@@ -1585,7 +1623,7 @@ const tableCompositionInput = ViewPlugin.fromClass(class {
     })
     // 只派发实际转义差异；整段先删后插会把组字末尾的光标映回开头。
     const repair = view.state.changes(repairs)
-    view.dispatch({ changes: repair, selection: view.state.selection.map(repair), effects: setTableComposition.of(false), annotations: tableEdit.of(true), userEvent: 'input.type.compose' })
+    dispatchCellEdit(view, view.state.update({ changes: repair, selection: view.state.selection.map(repair), effects: setTableComposition.of(false), annotations: tableEdit.of(true), userEvent: 'input.type.compose' }))
   }
   destroy(): void { this.destroyed = true }
   schedule(): void {
@@ -1657,6 +1695,7 @@ export const tableEditing = [
   virtualCell,
   tableParagraph,
   tableParagraphHistory,
+  tableCellHistory,
   tableParagraphLifecycle,
   emptyCellFocus,
   tableField,
@@ -1699,14 +1738,14 @@ export const tableEditing = [
     if (!current) return tr
     const { target, cell } = current
     let head = range.head
+    if (range.empty) head = cell ? Math.max(tr.docChanged ? cell.left : cell.start, Math.min(tr.docChanged ? cell.right : cell.end, head)) : target.to
     if (!tr.docChanged) {
-      if (range.empty) head = cell ? Math.max(cell.start, Math.min(cell.end, head)) : target.to
       // 隐藏的转义符和它后面的字之间看不出位置：向右移一个字时越过这一对，其余落在它前面
       if (cell && hiddenEscapes(tr.state, cell).includes(head - 1)) {
         head += !tr.isUserEvent('select.pointer') && tr.startState.selection.main.head === head - 1 ? 1 : -1
       }
     }
-    const assoc = (range.empty ? cellAssoc(cell, head) : 0) || range.assoc
+    const assoc = (range.empty ? cellAssoc(cell, head, mapped ? undefined : tr.state) : 0) || range.assoc
     if (head === range.head && assoc === range.assoc) return tr
     const next = range.empty ? EditorSelection.cursor(head, assoc, range.bidiLevel ?? undefined, range.goalColumn) : EditorSelection.range(range.anchor, head, range.goalColumn, range.bidiLevel ?? undefined, assoc)
     return [tr, { selection: tr.newSelection.replaceRange(next), sequential: true }]
@@ -1750,6 +1789,7 @@ export const tableEditing = [
   EditorState.transactionFilter.of(tr => {
     if (!tr.docChanged || tr.annotation(tableEdit) || tr.startState.field(tableComposition, false) || tr.isUserEvent('input.type.compose') || !isCellEdit(tr)) return tr
     const changes: { from: number; to: number; insert: string }[] = []
+    let caret: { position: number } | undefined
     let rewritten = false
     let rejected = false
     const rows = new Set<number>()
@@ -1759,19 +1799,21 @@ export const tableEditing = [
       if (cell) rows.add(tr.startState.doc.lineAt(cell.left).from)
       const change = cell ? cellChange(tr.startState, cell, from, to, text) : { from, to, insert: text }
       if (!change) { rejected = true; return }
+      if ('cursor' in change && typeof change.cursor === 'number') caret = { position: change.cursor }
       rewritten ||= !unchanged(change, from, to, text)
       changes.push(change)
     })
     if (rejected) return []
     if (changes.some((change, index) => index && change.from < changes[index - 1].to)) return []
-    const safe = preserveTableRows(tr.startState, changes, rows)
+    if (changes.length !== 1 || tr.newSelection.ranges.length !== 1 || !tr.newSelection.main.empty) caret = undefined
+    const safe = preserveTableRows(tr.startState, changes, rows, undefined, caret)
     rewritten ||= safe.length !== changes.length || safe.some((change, index) => !unchanged(change, changes[index].from, changes[index].to, changes[index].insert))
     if (!rewritten) return tr
     const set = tr.startState.changes(safe)
     // 单光标单处改动时光标落在新内容之后；多光标、拖动把原来的选区换算过来
     const mapPos = (pos: number, assoc: number) => set.mapPos(tr.changes.invertedDesc.mapPos(pos, assoc), assoc)
-    const selection = safe.length === 1 && tr.newSelection.ranges.length === 1 && tr.newSelection.main.empty
-      ? EditorSelection.create([EditorSelection.cursor(mapPos(tr.newSelection.main.head, 1), -1)])
+    const selection = caret || safe.length === 1 && tr.newSelection.ranges.length === 1 && tr.newSelection.main.empty
+      ? EditorSelection.create([EditorSelection.cursor(caret?.position ?? mapPos(tr.newSelection.main.head, 1), -1)])
       : EditorSelection.create(tr.newSelection.ranges.map(range => range.empty
         ? EditorSelection.cursor(mapPos(range.head, range.assoc || 1), range.assoc)
         : EditorSelection.range(mapPos(range.anchor, range.anchor < range.head ? -1 : 1), mapPos(range.head, range.anchor < range.head ? 1 : -1))), tr.newSelection.mainIndex)
@@ -1863,10 +1905,10 @@ export const tableEditing = [
       event.preventDefault()
       if (target) {
         const anchor = Math.max(target.start, Math.min(target.end, view.posAtCoords({ x: event.clientX, y: event.clientY }) ?? target.start))
-        view.dispatch({ selection: EditorSelection.create([EditorSelection.cursor(anchor, cellAssoc(target, anchor))]), effects: setVirtualCell.of({ row: table.rows[rowIndex].from, column }) })
-      } else selectCell(view, table, rowIndex, column, false)
+        view.dispatch({ selection: EditorSelection.create([EditorSelection.cursor(anchor, cellAssoc(target, anchor, view.state))]), effects: setVirtualCell.of({ row: table.rows[rowIndex].from, column }) })
+      } else selectCell(view, table, rowIndex, column, false, undefined, false)
       const input = cell.querySelector<HTMLElement>('.cm-md-table-input')
-      if (input) input.focus()
+      if (input) input.focus({ preventScroll: true })
       else view.focus()
       return true
     },
@@ -1882,7 +1924,7 @@ export const tableEditing = [
       if (!current || text === undefined || !view.state.facet(EditorView.editable) || view.state.readOnly) return false
       if (!text.includes('\t')) {
         const { from, to } = view.state.selection.main
-        if (!insertCellText(view, from, to, text)) return false
+        if (!insertCellText(view, from, to, text, 'input.paste')) return false
         view.focus()
         event.preventDefault()
         return true
@@ -1934,7 +1976,7 @@ export const tableEditing = [
         added += '\n' + text.split('').map((char, index) => (escapes.has(index) ? '\\' : '') + char).join('')
       }
       if (added) safe.push({ from: table.to, to: table.to, insert: added })
-      editTable(view, table, safe, row + values.length - 1, column + values.at(-1)!.length - 1)
+      editTable(view, table, safe, row + values.length - 1, column + values.at(-1)!.length - 1, undefined, 'input.paste')
       view.focus()
       event.preventDefault()
       return true

@@ -27,6 +27,7 @@ const DROP_CLASSES = new Set([
   // 光标所在的那一行会把 markdown 标记（`**`、`#`、`==` 等）露出来给人看，
   // 它们不属于正文，交出去的那份里不能带
   'cm-md-marker',
+  'cm-md-table-caret-anchor',
   'cm-md-table-marker',
   'cm-md-table-paragraph',
 ])

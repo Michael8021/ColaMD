@@ -21,7 +21,7 @@
 // 表现为「整个界面错乱」。StateField + provide 提供的是装饰集本身，不是函数，
 // 跨行替换与块级 widget 才被允许。
 
-import { Decoration, EditorView, ViewPlugin, WidgetType, type DecorationSet, type ViewUpdate } from '@codemirror/view'
+import { Decoration, EditorView, ViewPlugin, WidgetType, type DecorationSet, type Rect, type ViewUpdate } from '@codemirror/view'
 import { EditorState, MapMode, RangeSetBuilder, StateEffect, StateField, type Extension } from '@codemirror/state'
 import { forceParsing, syntaxTree } from '@codemirror/language'
 import type { SyntaxNode, SyntaxNodeRef } from '@lezer/common'
@@ -433,7 +433,6 @@ function listDepth(node: SyntaxNode): number {
 /** 扫描公式并压入装饰。 */
 function collectMath(state: EditorState, ranges: DecorationRange[], text: string, excluded: Excluded[]): void {
   if (!/[$\\]/.test(text)) return
-
   // 排除区：属性区、代码块、行内代码、行内 HTML。
   // 这些地方里的 `$x$` 不该渲染成公式——代码就是代码，Obsidian 也是这么处理的。
   for (const range of scanMath(text, excluded)) {
@@ -767,6 +766,30 @@ class HTMLWidget extends WidgetType {
   }
 }
 
+class TableBreakWidget extends HTMLWidget {
+  toDOM(): HTMLElement {
+    const wrap = super.toDOM()
+    wrap.classList.add('cm-md-table-break')
+    for (const side of ['before', 'after']) {
+      const anchor = document.createElement('span')
+      anchor.className = 'cm-md-table-caret-anchor'
+      anchor.dataset.side = side
+      anchor.setAttribute('aria-hidden', 'true')
+      if (side === 'before') wrap.prepend(anchor)
+      else wrap.append(anchor)
+    }
+    return wrap
+  }
+  get lineBreaks(): number { return 1 }
+  coordsAt(dom: HTMLElement, pos: number): Rect | null {
+    const anchor = dom.querySelector<HTMLElement>(`[data-side="${pos === 0 ? 'before' : 'after'}"]`)
+    if (!anchor) return null
+    const rect = anchor.getBoundingClientRect()
+    return { left: rect.left, right: rect.left, top: rect.top, bottom: rect.bottom }
+  }
+  ignoreEvent(): boolean { return false }
+}
+
 function collectHTML(state: EditorState, ranges: DecorationRange[], front: Range | null): void {
   // 成对的行内标签（`<span style="color:red">文字</span>`）一起处理：闭标签的起点记下来，
   // 轮到它时就跳过。否则两个标签各自成一个 widget，样式落在空标签上（#125）。
@@ -788,10 +811,14 @@ function collectHTML(state: EditorState, ranges: DecorationRange[], front: Range
         return false
       }
     }
+    let parent = node.node.parent
+    while (parent && parent.name !== 'TableCell') parent = parent.parent
+    const source = state.doc.sliceString(node.from, node.to)
+    const widget = parent && /^<br\s*\/?\s*>$/i.test(source) ? TableBreakWidget : HTMLWidget
     ranges.push({
       from: node.from,
       to: node.to,
-      deco: Decoration.replace({ widget: new HTMLWidget(state.doc.sliceString(node.from, node.to), block, node.from, node.to) }),
+      deco: Decoration.replace({ widget: new widget(source, block, node.from, node.to) }),
     })
     return false
   })
@@ -1137,6 +1164,8 @@ function buildDecorations(state: EditorState, flash: { from: number; to: number 
  * 重算是「文档变了或选区变了」才做：选区决定哪些标记显形，所以点一下也要重算。
  * 其余事务（比如落点高亮的开关）由 effect 单独驱动，靠 flash 值判断。
  */
+const tableBreakAtoms = new WeakMap<DecorationSet, DecorationSet>()
+
 export const livePreviewField = StateField.define<DecorationSet>({
   create: (state) => buildDecorations(state, null),
   update(deco, tr) {
@@ -1155,7 +1184,15 @@ export const livePreviewField = StateField.define<DecorationSet>({
     if (!tr.docChanged && !tr.selection && !flash && !parsed && !rebased && focused === wasFocused && clean === wasClean) return deco
     return buildDecorations(tr.state, flashValue)
   },
-  provide: (field) => EditorView.decorations.from(field),
+  provide: (field) => [EditorView.decorations.from(field), EditorView.atomicRanges.of(view => {
+    const decorations = view.state.field(field)
+    let atoms = tableBreakAtoms.get(decorations)
+    if (!atoms) {
+      atoms = decorations.update({ filter: (_from, _to, value) => value.spec.widget instanceof TableBreakWidget })
+      tableBreakAtoms.set(decorations, atoms)
+    }
+    return atoms
+  })],
 })
 
 /** 解析往前推进之后，请重算一次装饰。 */

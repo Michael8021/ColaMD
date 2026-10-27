@@ -20,9 +20,13 @@ const inspect = port + 1000
 const isolatedHome = join(dir, 'home')
 mkdirSync(isolatedHome, { recursive: true })
 const launcher = join(dir, 'launch.cjs')
-writeFileSync(launcher, `const {app}=require('electron');app.setPath('home',${JSON.stringify(isolatedHome)});require(${JSON.stringify(join(ROOT, 'scripts/offscreen-window.cjs'))})`)
+writeFileSync(launcher, `const {app}=require('electron');app.setPath('home',${JSON.stringify(isolatedHome)});if(process.env.COLAMD_VERIFY_VISIBLE==='1'){app.on('browser-window-created',(_event,win)=>win.webContents.setBackgroundThrottling(false));require(${JSON.stringify(join(ROOT, 'dist/main/index.js'))})}else require(${JSON.stringify(join(ROOT, 'scripts/offscreen-window.cjs'))})`)
 const child = spawn(electron, [launcher, file, `--user-data-dir=${udd}`, `--remote-debugging-port=${port}`, `--inspect=${inspect}`], { cwd: ROOT, stdio: 'ignore' })
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+let measure = async () => {}
+const sleep = async ms => {
+  await new Promise(resolve => setTimeout(resolve, ms))
+  await measure()
+}
 let ws, mainWS, passed = 0
 const errors = []
 const check = (name, value, detail = '') => {
@@ -99,6 +103,7 @@ try {
     await sleep(100)
   }
   await evaluate(`window.v = document.querySelector('#editor .cm-content').cmTile.root.view; v.focus()`)
+  measure = () => evaluate('v.requestMeasure(); v.coordsAtPos(v.state.selection.main.head); undefined')
   const doc = () => evaluate('v.state.doc.toString()')
   const key = async (key, modifiers = 0) => {
     const codes = { Tab: 9, Enter: 13, Backspace: 8, Delete: 46, ArrowLeft: 37, ArrowRight: 39, ArrowUp: 38, ArrowDown: 40, z: 90, a: 65, Home: 36, End: 35 }
@@ -441,6 +446,7 @@ try {
       for (const theme of ['elegant','bear','custom:template.css']) {
         await setTheme(theme, theme.startsWith('custom:') ? readFileSync(join(ROOT,'themes/template.css'),'utf8') : undefined)
         await setDoc(source)
+        for (let attempt = 0; attempt < 40 && !await evaluate(`!![...v.contentDOM.querySelectorAll('.cm-md-codeblock')].find(line => line.textContent.includes('const s'))?.querySelector('span')`); attempt++) await sleep(50)
         check(`${theme} 正文与表格转义竖线使用正文色`, await evaluate(`(() => {
           const walker=document.createTreeWalker(v.contentDOM,NodeFilter.SHOW_TEXT);let node,seen=0;
           while(node=walker.nextNode()) {

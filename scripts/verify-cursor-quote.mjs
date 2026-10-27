@@ -7,14 +7,16 @@ export async function verifyCursorQuote({ evaluate, send, key, setDoc, type, che
   const record = (name, ok, detail) => { const r = { name, ok, ...detail }; records.push(r); if (!ok) failures.push(r) }
   const quote = '> | 名称 | 数量 | 备注 |\n> | --- | ---: | --- |\n> | 引用甲 | 2 | 可编辑 |\n> | 引用乙 |  | 空格 |\n>\n> 引用内的后续段落。\n\n试末格。'
   const click = async (text, offset = 0, lineHint = null) => {
-    await evaluate(`(() => {const p=${lineHint===null?'v.state.doc.toString().indexOf('+JSON.stringify(text)+')':'v.state.doc.line('+lineHint+').from'};v.scrollDOM.scrollTop=Math.max(0,v.lineBlockAt(p).top-150)})()`)
+    const position = await evaluate(`(() => {const p=${lineHint===null?'v.state.doc.toString().indexOf('+JSON.stringify(text)+')':'v.state.doc.line('+lineHint+').from'};v.requestMeasure();v.scrollDOM.scrollTop=Math.max(0,v.lineBlockAt(p).top-150);v.requestMeasure();v.coordsAtPos(p);return p})()`)
     await wait(120)
     // 高度表若已漂移，先按实际 DOM 滚到目标，不能拿错误估计当点击坐标。
-    for(let i=0;i<3;i++) {
-      await evaluate(`(() => {const w=document.createTreeWalker(v.contentDOM,NodeFilter.SHOW_TEXT);for(let n;n=w.nextNode();)if(n.textContent.includes(${JSON.stringify(text)})&&(${lineHint===null?'true':'v.state.doc.lineAt(v.posAtDOM(n,0)).number==='+lineHint})){n.parentElement.scrollIntoView({block:'center'});break}})()`)
+    for(let i=0;i<30;i++) {
+      const found = await evaluate(`(() => {const w=document.createTreeWalker(v.contentDOM,NodeFilter.SHOW_TEXT);for(let n;n=w.nextNode();)if(n.textContent.includes(${JSON.stringify(text)})&&(${lineHint===null?'true':'v.state.doc.lineAt(v.posAtDOM(n,0)).number==='+lineHint})){n.parentElement.scrollIntoView({block:'center'});return n.parentElement.getBoundingClientRect().height>0}return false})()`)
       await wait(80)
+      if(found)break
+      await evaluate(`v.requestMeasure();v.scrollDOM.scrollTop=Math.max(0,v.lineBlockAt(${position}).top-150);v.requestMeasure();v.coordsAtPos(${position})`)
     }
-    const box = await evaluate(`(() => {const w=document.createTreeWalker(v.contentDOM,NodeFilter.SHOW_TEXT);for(let n;n=w.nextNode();){const i=n.textContent.indexOf(${JSON.stringify(text)});if(i<0||!(${lineHint===null?'true':'v.state.doc.lineAt(v.posAtDOM(n,0)).number==='+lineHint}))continue;const r=document.createRange();r.setStart(n,i+${offset});r.setEnd(n,i+${offset}+1);const b=r.getBoundingClientRect();if(b.width&&b.height)return {x:b.left+1,y:(b.top+b.bottom)/2,expected:v.posAtDOM(n,i+${offset})}}throw Error('未找到点击文字')})()`)
+    const box = await evaluate(`(() => {const w=document.createTreeWalker(v.contentDOM,NodeFilter.SHOW_TEXT);for(let n;n=w.nextNode();){const i=n.textContent.indexOf(${JSON.stringify(text)});if(i<0||!(${lineHint===null?'true':'v.state.doc.lineAt(v.posAtDOM(n,0)).number==='+lineHint}))continue;const r=document.createRange();r.setStart(n,i+${offset});r.setEnd(n,i+${offset}+1);const b=r.getBoundingClientRect();if(b.width&&b.height)return {x:b.left+1,y:(b.top+b.bottom)/2,expected:v.posAtDOM(n,i+${offset})}}throw Error('未找到点击文字 '+JSON.stringify({text:${JSON.stringify(text)},scroll:v.scrollDOM.scrollTop,viewport:v.viewport}))})()`)
     const before=await evaluate(`v.posAtCoords({x:${box.x},y:${box.y}})`)
     for(const t of ['mousePressed','mouseReleased'])await send('Input.dispatchMouseEvent',{type:t,x:box.x,y:box.y,button:'left',clickCount:1})
     await wait(60)

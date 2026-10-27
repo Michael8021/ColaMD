@@ -506,6 +506,13 @@
   white-space: normal;
 }
 
+.cm-content .cm-md-table-caret-anchor {
+  display: inline-block;
+  width: 0;
+  height: 1em;
+  vertical-align: baseline;
+}
+
 /* ======= 图片 ======= */
 
 /*
