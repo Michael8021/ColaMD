@@ -7,6 +7,9 @@
 // 所以这里做一次翻译：行 → `<p>`，连续的同类行合并成 `<ul>`/`<ol>`/`<blockquote>`/`<pre>`，
 // 装饰类 → 语义标签。**只读**：它不改编辑器里的任何东西，改的是要交出去的那份拷贝。
 
+import katex from 'katex'
+import { scanMath } from './math-scan'
+
 /** 元素上的装饰类 → 语义标签。没登记的类原样透传（KaTeX、mermaid、图片要保住）。 */
 const INLINE_TAGS: Record<string, string> = {
   'cm-md-strong': 'strong',
@@ -91,6 +94,16 @@ function inlineHTML(node: Node): string {
   }
   if (classes.contains('cm-md-footnote-ref')) {
     return `<sup>${escapeText(node.textContent ?? '')}</sup>`
+  }
+  // 正在编辑的完整行内公式也要交成渲染结果；局部复制保留所选原文。
+  if (classes.contains('cm-md-math-source')) {
+    const source = node.textContent ?? ''
+    const range = scanMath(source)[0]
+    if (range?.from === 0 && range.to === source.length) {
+      try { return katex.renderToString(range.code, { displayMode: false, throwOnError: true, trust: false }) }
+      catch { /* 无效公式保留源码，不能丢字。 */ }
+    }
+    return escapeText(source)
   }
   // 公式（KaTeX）、mermaid 图、图片：它们已经是能独立成立的 HTML，原样带走
   if (classes.contains('cm-md-math') || classes.contains('cm-md-mermaid')) {
